@@ -11,221 +11,160 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ================== НАСТРОЙКИ ==================
+# ====== CONFIG ======
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "predictor.db"
-# ===============================================
+# ====================
 
 dp = Dispatcher()
 
-# ------------------ FAKE HTTP SERVER (для Render) ------------------
+# ===== Fake HTTP server (Render free) =====
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is running")
 
-def run_http_server():
+def run_http():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), DummyHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), DummyHandler).serve_forever()
 
-threading.Thread(target=run_http_server, daemon=True).start()
-# ------------------------------------------------------------------
+threading.Thread(target=run_http, daemon=True).start()
+# ========================================
 
 
-# ------------------ DB ------------------
+# ===== DATABASE =====
 def db():
     return sqlite3.connect(DB_PATH)
 
 def init_db():
     with db() as con:
         con.execute("""
-        CREATE TABLE IF NOT EXISTS matches (
+        CREATE TABLE IF NOT EXISTS matches(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'open',
-            result TEXT
+            title TEXT,
+            status TEXT DEFAULT 'open',
+            result_1x2 TEXT
         )
         """)
         con.execute("""
-        CREATE TABLE IF NOT EXISTS votes (
-            match_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+        CREATE TABLE IF NOT EXISTS votes(
+            match_id INTEGER,
+            user_id INTEGER,
             username TEXT,
-            choice TEXT NOT NULL,
-            voted_at TEXT NOT NULL,
-            PRIMARY KEY (match_id, user_id)
-        )
-        """)
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS scores (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            points INTEGER NOT NULL DEFAULT 0,
-            last_update TEXT
+            bet_type TEXT,
+            choice TEXT,
+            PRIMARY KEY(match_id, user_id)
         )
         """)
         con.commit()
 
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+def is_admin(uid): return uid == ADMIN_ID
 
-def create_match(title: str) -> int:
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO matches(title, created_at, status) VALUES(?,?, 'open')",
-            (title, datetime.utcnow().isoformat())
-        )
-        con.commit()
-        return cur.lastrowid
-
-def list_open_matches():
-    with db() as con:
-        cur = con.execute("SELECT id, title FROM matches WHERE status='open'")
-        return cur.fetchall()
-
-def get_match(match_id: int):
-    with db() as con:
-        cur = con.execute("SELECT id, title, status, result FROM matches WHERE id=?", (match_id,))
-        return cur.fetchone()
-
-def set_vote(match_id: int, user_id: int, username: str | None, choice: str):
-    with db() as con:
-        con.execute("""
-        INSERT INTO votes(match_id, user_id, username, choice, voted_at)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(match_id, user_id) DO UPDATE SET
-            choice=excluded.choice,
-            voted_at=excluded.voted_at
-        """, (match_id, user_id, username, choice, datetime.utcnow().isoformat()))
-        con.commit()
-
-def close_match(match_id: int):
-    with db() as con:
-        con.execute("UPDATE matches SET status='closed' WHERE id=?", (match_id,))
-        con.commit()
-
-def set_result_and_score(match_id: int, result: str):
-    with db() as con:
-        cur = con.execute("SELECT status FROM matches WHERE id=?", (match_id,))
-        row = cur.fetchone()
-        if not row:
-            return "not_found"
-        if row[0] != "closed":
-            return "not_closed"
-
-        con.execute("UPDATE matches SET result=?, status='scored' WHERE id=?", (result, match_id))
-        cur = con.execute("SELECT user_id, username FROM votes WHERE match_id=? AND choice=?",
-                          (match_id, result))
-        winners = cur.fetchall()
-
-        for user_id, username in winners:
-            con.execute("""
-            INSERT INTO scores(user_id, username, points, last_update)
-            VALUES(?,?,1,?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                points=points+1
-            """, (user_id, username, datetime.utcnow().isoformat()))
-
-        con.commit()
-        return len(winners)
-
-def leaderboard():
-    with db() as con:
-        cur = con.execute("SELECT username, points FROM scores ORDER BY points DESC LIMIT 10")
-        return cur.fetchall()
-
-# ------------------ UI ------------------
-def vote_kb(match_id: int):
+# ===== KEYBOARDS =====
+def bet_type_kb(mid):
     kb = InlineKeyboardBuilder()
-    kb.button(text="🏠 Победа хозяев", callback_data=f"vote:{match_id}:home")
-    kb.button(text="🤝 Ничья", callback_data=f"vote:{match_id}:draw")
-    kb.button(text="🚌 Победа гостей", callback_data=f"vote:{match_id}:away")
+    kb.button(text="1️⃣ 1X2", callback_data=f"type:{mid}:1x2")
+    kb.button(text="🎯 Точный счёт", callback_data=f"type:{mid}:score")
+    kb.button(text="⚽ Тотал", callback_data=f"type:{mid}:total")
+    kb.button(text="🔥 Обе забьют", callback_data=f"type:{mid}:btts")
+    kb.adjust(2)
+    return kb.as_markup()
+
+def kb_1x2(mid):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Хозяева", callback_data=f"vote:{mid}:1x2:home")
+    kb.button(text="🤝 Ничья", callback_data=f"vote:{mid}:1x2:draw")
+    kb.button(text="🚌 Гости", callback_data=f"vote:{mid}:1x2:away")
     kb.adjust(1)
     return kb.as_markup()
 
-def choice_label(choice: str):
-    return {"home": "Победа хозяев", "draw": "Ничья", "away": "Победа гостей"}[choice]
+def kb_score(mid):
+    kb = InlineKeyboardBuilder()
+    for s in ["1:0","2:1","1:1","0:0"]:
+        kb.button(text=s, callback_data=f"vote:{mid}:score:{s}")
+    kb.adjust(2)
+    return kb.as_markup()
 
-# ------------------ HANDLERS ------------------
+def kb_total(mid):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⚽ Больше 2.5", callback_data=f"vote:{mid}:total:over")
+    kb.button(text="🧱 Меньше 2.5", callback_data=f"vote:{mid}:total:under")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def kb_btts(mid):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да", callback_data=f"vote:{mid}:btts:yes")
+    kb.button(text="❌ Нет", callback_data=f"vote:{mid}:btts:no")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ===== HANDLERS =====
 @dp.message(CommandStart())
-async def start(message: Message):
-    await message.answer(
-        "Я бот-предиктор 🤖\n"
+async def start(m: Message):
+    await m.answer(
+        "🤖 Бот-предиктор\n\n"
         "/matches — матчи\n"
-        "/leaderboard — топ\n"
-        "Админ: /newmatch /close /setresult"
+        "Прогнозы делаются кнопками 👇"
     )
 
 @dp.message(Command("matches"))
-async def matches_cmd(message: Message):
-    rows = list_open_matches()
+async def matches(m: Message):
+    with db() as con:
+        rows = con.execute("SELECT id,title FROM matches WHERE status='open'").fetchall()
     if not rows:
-        await message.answer("Активных матчей нет.")
+        await m.answer("Нет активных матчей.")
         return
-    text = "Матчи:\n"
+    text = "Активные матчи:\n"
     for mid, title in rows:
-        text += f"\n#{mid} — {title}\n/vote {mid}"
-    await message.answer(text)
+        text += f"\n#{mid} {title}\n/vote {mid}"
+    await m.answer(text)
 
 @dp.message(Command("vote"))
-async def vote_cmd(message: Message):
-    mid = int(message.text.split()[1])
-    m = get_match(mid)
-    if not m or m[2] != "open":
-        await message.answer("Голосование закрыто.")
-        return
-    await message.answer(f"{m[1]}\nВыбери исход:", reply_markup=vote_kb(mid))
+async def vote(m: Message):
+    mid = int(m.text.split()[1])
+    await m.answer("Выбери тип прогноза:", reply_markup=bet_type_kb(mid))
+
+@dp.callback_query(F.data.startswith("type:"))
+async def choose_type(c: CallbackQuery):
+    _, mid, t = c.data.split(":")
+    mid = int(mid)
+    if t == "1x2":
+        await c.message.edit_text("Выбери исход 1X2:", reply_markup=kb_1x2(mid))
+    elif t == "score":
+        await c.message.edit_text("Выбери точный счёт:", reply_markup=kb_score(mid))
+    elif t == "total":
+        await c.message.edit_text("Выбери тотал:", reply_markup=kb_total(mid))
+    elif t == "btts":
+        await c.message.edit_text("Обе забьют?", reply_markup=kb_btts(mid))
 
 @dp.callback_query(F.data.startswith("vote:"))
-async def vote_cb(call: CallbackQuery):
-    _, mid, choice = call.data.split(":")
-    set_vote(int(mid), call.from_user.id, call.from_user.username, choice)
-    await call.answer("Голос принят ✅", show_alert=True)
+async def save_vote(c: CallbackQuery):
+    _, mid, bet_type, choice = c.data.split(":")
+    with db() as con:
+        con.execute("""
+        INSERT OR REPLACE INTO votes
+        VALUES (?,?,?,?,?)
+        """, (int(mid), c.from_user.id, c.from_user.username, bet_type, choice))
+        con.commit()
+    await c.answer("Прогноз сохранён ✅", show_alert=True)
 
+# ===== ADMIN =====
 @dp.message(Command("newmatch"))
-async def newmatch_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    title = message.text.replace("/newmatch", "").strip()
-    mid = create_match(title)
-    await message.answer(f"Создан матч #{mid}")
+async def newmatch(m: Message):
+    if not is_admin(m.from_user.id): return
+    title = m.text.replace("/newmatch","").strip()
+    with db() as con:
+        con.execute("INSERT INTO matches(title) VALUES(?)", (title,))
+        con.commit()
+    await m.answer("Матч создан ✅")
 
-@dp.message(Command("close"))
-async def close_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    mid = int(message.text.split()[1])
-    close_match(mid)
-    await message.answer("Матч закрыт")
-
-@dp.message(Command("setresult"))
-async def setresult_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    _, mid, result = message.text.split()
-    winners = set_result_and_score(int(mid), result)
-    await message.answer(f"Результат сохранён. Победителей: {winners}")
-
-@dp.message(Command("leaderboard"))
-async def lb_cmd(message: Message):
-    rows = leaderboard()
-    text = "🏆 Топ:\n"
-    for i, (user, pts) in enumerate(rows, 1):
-        text += f"{i}. @{user} — {pts}\n"
-    await message.answer(text)
-
-# ------------------ MAIN ------------------
+# ===== MAIN =====
 async def main():
     logging.basicConfig(level=logging.INFO)
-    if not TOKEN:
-        raise RuntimeError("Нет BOT_TOKEN")
-    if ADMIN_ID == 0:
-        raise RuntimeError("Нет ADMIN_ID")
-
     init_db()
     bot = Bot(TOKEN)
     await dp.start_polling(bot)
