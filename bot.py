@@ -46,12 +46,11 @@ def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
 def current_season() -> str:
-    # сезон = месяц в UTC: YYYY-MM
+    # season = month: YYYY-MM (UTC)
     return datetime.utcnow().strftime("%Y-%m")
 
 def init_db():
     with db() as con:
-        # пользователи
         con.execute("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
@@ -63,27 +62,24 @@ def init_db():
             last_rank_season INTEGER DEFAULT NULL
         )
         """)
-        # матчи
         con.execute("""
         CREATE TABLE IF NOT EXISTS matches(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'open'  -- open/closed
+            status TEXT NOT NULL DEFAULT 'open'
         )
         """)
-        # голоса: ключ (match_id,user_id,bet_type), чтобы можно было делать несколько типов прогнозов на один матч
         con.execute("""
         CREATE TABLE IF NOT EXISTS votes(
             match_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             username TEXT,
-            bet_type TEXT NOT NULL,  -- 1x2/score/total/btts
+            bet_type TEXT NOT NULL,
             choice TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY(match_id, user_id, bet_type)
         )
         """)
-        # результаты (для начисления очков)
         con.execute("""
         CREATE TABLE IF NOT EXISTS results(
             match_id INTEGER NOT NULL,
@@ -93,7 +89,7 @@ def init_db():
             PRIMARY KEY(match_id, bet_type)
         )
         """)
-        # очки по сезонам
+        # season scores
         con.execute("""
         CREATE TABLE IF NOT EXISTS scores_season(
             season TEXT NOT NULL,
@@ -107,7 +103,7 @@ def init_db():
             PRIMARY KEY(season, user_id)
         )
         """)
-        # подписки
+        # follows
         con.execute("""
         CREATE TABLE IF NOT EXISTS follows(
             follower_id INTEGER NOT NULL,
@@ -116,7 +112,7 @@ def init_db():
             PRIMARY KEY(follower_id, followee_id)
         )
         """)
-        # ачивки
+        # achievements
         con.execute("""
         CREATE TABLE IF NOT EXISTS user_achievements(
             user_id INTEGER NOT NULL,
@@ -124,6 +120,14 @@ def init_db():
             key TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY(user_id, season, key)
+        )
+        """)
+        # user state (for find player flow)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS user_state(
+            user_id INTEGER PRIMARY KEY,
+            state TEXT,
+            updated_at TEXT
         )
         """)
         con.commit()
@@ -154,7 +158,10 @@ def upsert_user(user_id: int, username: Optional[str], first_name: Optional[str]
 
 def ensure_score_row(season: str, user_id: int, username: Optional[str]):
     with db() as con:
-        row = con.execute("SELECT 1 FROM scores_season WHERE season=? AND user_id=?", (season, user_id)).fetchone()
+        row = con.execute(
+            "SELECT 1 FROM scores_season WHERE season=? AND user_id=?",
+            (season, user_id)
+        ).fetchone()
         if not row:
             con.execute("""
                 INSERT INTO scores_season(season, user_id, username, points, correct, total, streak, best_streak)
@@ -229,8 +236,10 @@ def follow_user(follower_id: int, followee_id: int) -> str:
         return "self"
     with db() as con:
         try:
-            con.execute("INSERT INTO follows(follower_id, followee_id, created_at) VALUES(?,?,?)",
-                        (follower_id, followee_id, now_iso()))
+            con.execute(
+                "INSERT INTO follows(follower_id, followee_id, created_at) VALUES(?,?,?)",
+                (follower_id, followee_id, now_iso())
+            )
             con.commit()
             return "ok"
         except sqlite3.IntegrityError:
@@ -238,8 +247,7 @@ def follow_user(follower_id: int, followee_id: int) -> str:
 
 def unfollow_user(follower_id: int, followee_id: int) -> str:
     with db() as con:
-        con.execute("DELETE FROM follows WHERE follower_id=? AND followee_id=?",
-                    (follower_id, followee_id))
+        con.execute("DELETE FROM follows WHERE follower_id=? AND followee_id=?", (follower_id, followee_id))
         con.commit()
     return "ok"
 
@@ -252,7 +260,7 @@ def get_rank(season: str, user_id: int) -> Optional[int]:
             ORDER BY points DESC, user_id ASC
         """, (season,)).fetchall()
     for i, r in enumerate(rows, start=1):
-        if r["user_id"] == user_id:
+        if int(r["user_id"]) == int(user_id):
             return i
     return None
 
@@ -268,12 +276,49 @@ def get_last_rank(user_id: int) -> Optional[int]:
             return None
         return r["last_rank_season"]
 
+# ---------- user state (for "Find player") ----------
+def set_state(user_id: int, state: Optional[str]):
+    with db() as con:
+        if state is None:
+            con.execute("DELETE FROM user_state WHERE user_id=?", (user_id,))
+        else:
+            con.execute("""
+                INSERT INTO user_state(user_id, state, updated_at)
+                VALUES(?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    state=excluded.state,
+                    updated_at=excluded.updated_at
+            """, (user_id, state, now_iso()))
+        con.commit()
+
+def get_state(user_id: int) -> Optional[str]:
+    with db() as con:
+        r = con.execute("SELECT state FROM user_state WHERE user_id=?", (user_id,)).fetchone()
+        return r["state"] if r else None
+
+def find_user_by_username(username: str) -> Optional[int]:
+    u = (username or "").strip()
+    if u.startswith("@"):
+        u = u[1:]
+    u = u.strip()
+    if not u:
+        return None
+    with db() as con:
+        r = con.execute("""
+            SELECT user_id FROM users
+            WHERE LOWER(username)=LOWER(?)
+            ORDER BY last_seen DESC
+            LIMIT 1
+        """, (u,)).fetchone()
+        return int(r["user_id"]) if r else None
+
 
 # ===================== Labels & UI =====================
 BTN_ACTIVE = "⚽ Активные матчи"
 BTN_MY = "📊 Мои прогнозы"
 BTN_LB = "🏆 Лидерборд"
 BTN_PROFILE = "👤 Профиль"
+BTN_FIND = "🔎 Найти игрока"
 BTN_HELP = "ℹ️ Помощь"
 BTN_NEW = "➕ Создать матч"
 BTN_BACK = "⬅️ Назад"
@@ -297,6 +342,7 @@ def main_menu_kb(user_is_admin: bool):
     kb.button(text=BTN_MY)
     kb.button(text=BTN_LB)
     kb.button(text=BTN_PROFILE)
+    kb.button(text=BTN_FIND)
     kb.button(text=BTN_HELP)
     if user_is_admin:
         kb.button(text=BTN_NEW)
@@ -324,7 +370,6 @@ def match_menu_kb(mid: int, user_is_admin: bool):
     return kb.as_markup()
 
 def bet_type_kb(mid: int, mode: str):
-    # mode: vote | setres
     kb = InlineKeyboardBuilder()
     kb.button(text="1️⃣ 1X2", callback_data=f"type:{mode}:{mid}:1x2")
     kb.button(text="🎯 Точный счёт", callback_data=f"type:{mode}:{mid}:score")
@@ -373,9 +418,10 @@ def profile_kb(viewer_id: int, target_id: int):
     kb.adjust(1)
     return kb.as_markup()
 
+
 # ===================== Parsing helpers =====================
 def parse_match_button(text: str) -> Optional[int]:
-    text = text.strip()
+    text = (text or "").strip()
     if not text.startswith("🏟 #"):
         return None
     try:
@@ -386,18 +432,18 @@ def parse_match_button(text: str) -> Optional[int]:
         return None
 
 def start_payload(message: Message) -> Optional[str]:
-    # /start payload
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 2:
         return parts[1].strip()
     return None
 
-# ===================== Notifications (Layer 2) =====================
+
+# ===================== Notifications / Achievements / Rank =====================
 async def safe_dm(bot: Bot, user_id: int, text: str):
     try:
         await bot.send_message(user_id, text)
     except Exception:
-        # пользователь мог запретить/не стартовал бота
+        # user may not have started bot / blocked bot
         pass
 
 def achievement_unlocked(user_id: int, season: str, key: str) -> bool:
@@ -426,7 +472,7 @@ def achievement_text(key: str) -> str:
 async def check_and_notify_achievements(bot: Bot, season: str, user_id: int):
     with db() as con:
         row = con.execute("""
-            SELECT points, correct, total, streak
+            SELECT correct, total, streak
             FROM scores_season
             WHERE season=? AND user_id=?
         """, (season, user_id)).fetchone()
@@ -438,16 +484,12 @@ async def check_and_notify_achievements(bot: Bot, season: str, user_id: int):
     correct = int(row["correct"])
     streak = int(row["streak"])
 
-    # достижения
     if total >= 1 and achievement_unlocked(user_id, season, "first_pred"):
         await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("first_pred"))
-
     if correct >= 1 and achievement_unlocked(user_id, season, "first_win"):
         await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("first_win"))
-
     if streak >= 3 and achievement_unlocked(user_id, season, "streak3"):
         await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("streak3"))
-
     if streak >= 5 and achievement_unlocked(user_id, season, "streak5"):
         await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("streak5"))
 
@@ -456,7 +498,7 @@ async def notify_rank_change(bot: Bot, season: str, user_id: int):
     old_rank = get_last_rank(user_id)
     if new_rank is None:
         return
-    # уведомляем только если улучшил позицию (или впервые появился)
+
     if old_rank is None:
         set_last_rank(user_id, new_rank)
         await safe_dm(bot, user_id, f"🏆 Ты появился в рейтинге сезона {season}!\nТекущее место: #{new_rank}")
@@ -468,7 +510,8 @@ async def notify_rank_change(bot: Bot, season: str, user_id: int):
     else:
         set_last_rank(user_id, new_rank)
 
-# ===================== Scoring (Layer 3) =====================
+
+# ===================== Scoring =====================
 def can_score(mid: int, bet_type: str) -> bool:
     with db() as con:
         r = con.execute("SELECT scored FROM results WHERE match_id=? AND bet_type=?", (mid, bet_type)).fetchone()
@@ -476,9 +519,10 @@ def can_score(mid: int, bet_type: str) -> bool:
 
 def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int]:
     """
-    Ставит результат по типу прогноза и начисляет очки (+1) за верный прогноз.
-    Обновляет total/correct/streak в текущем сезоне.
-    Возвращает ("ok", winners_count) | ("already",0) | ("not_found",0)
+    Sets result once per match+bet_type and scores current season:
+    - total +1 for each participant
+    - if correct: points+1, correct+1, streak+1, best_streak update
+    - if wrong: streak = 0
     """
     if not can_score(mid, bet_type):
         return ("already", 0)
@@ -490,7 +534,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
         if not m:
             return ("not_found", 0)
 
-        # фиксируем результат
         con.execute("""
             INSERT INTO results(match_id, bet_type, result, scored)
             VALUES(?,?,?,1)
@@ -499,7 +542,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
               scored=1
         """, (mid, bet_type, result))
 
-        # все, кто голосовал по этому типу
         voters = con.execute("""
             SELECT user_id, COALESCE(username,'') as username, choice
             FROM votes
@@ -515,7 +557,7 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
 
             ensure_score_row(season, uid, uname)
 
-            # total +1 всем участникам по этому bet_type
+            # total +1
             con.execute("""
                 UPDATE scores_season
                 SET total = total + 1,
@@ -525,7 +567,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
 
             if choice == result:
                 winners_count += 1
-                # points +1, correct +1, streak +1, best_streak
                 con.execute("""
                     UPDATE scores_season
                     SET points = points + 1,
@@ -538,7 +579,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
                     WHERE season=? AND user_id=?
                 """, (season, uid))
             else:
-                # промах: streak сбрасываем
                 con.execute("""
                     UPDATE scores_season
                     SET streak = 0
@@ -586,7 +626,6 @@ def display_name(urow: sqlite3.Row) -> str:
         return "unknown"
     if urow["username"]:
         return f"@{urow['username']}"
-    # fallback
     fn = (urow["first_name"] or "").strip()
     ln = (urow["last_name"] or "").strip()
     n = (fn + " " + ln).strip()
@@ -622,11 +661,13 @@ def profile_text(season: str, urow, srow) -> str:
         f"➡️ Подписок: {following}"
     )
 
+
 # ===================== Handlers =====================
 @dp.message(CommandStart())
 async def start(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
     ensure_score_row(current_season(), message.from_user.id, message.from_user.username)
+    set_state(message.from_user.id, None)
 
     payload = start_payload(message)
     if payload and payload.startswith("profile_"):
@@ -638,22 +679,20 @@ async def start(message: Message):
             pass
 
     await message.answer(
-        "🤖 Predictor Bot\n\n"
-        "• «⚽ Активные матчи» → выбирай матч кнопкой\n"
-        "• Делай прогнозы, набирай очки, поднимайся в рейтинге\n"
-        "• Следи за профилями и подписывайся ⭐\n\n"
-        "Меню снизу 👇",
+        "🤖 Predictor Bot\n\nМеню снизу 👇",
         reply_markup=main_menu_kb(is_admin(message.from_user.id))
     )
 
 @dp.message(F.text == BTN_BACK)
 async def back_to_main(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, None)
     await message.answer("Главное меню 👇", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
 
 @dp.message(F.text == BTN_ACTIVE)
 async def active_matches(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, None)
     matches = get_open_matches()
     if not matches:
         await message.answer("Нет активных матчей.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
@@ -663,6 +702,7 @@ async def active_matches(message: Message):
 @dp.message(F.text.startswith("🏟 #"))
 async def picked_match(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, None)
 
     mid = parse_match_button(message.text)
     if mid is None:
@@ -730,14 +770,12 @@ async def choose_type_vote(call: CallbackQuery):
         await call.message.edit_text("Выбери тотал:", reply_markup=kb_total(mid, "vote"))
     elif bt == "btts":
         await call.message.edit_text("Обе забьют?", reply_markup=kb_btts(mid, "vote"))
-
     await call.answer()
 
 @dp.callback_query(F.data.startswith("vote:"))
 async def vote_cb(call: CallbackQuery):
     upsert_user(call.from_user.id, call.from_user.username, call.from_user.first_name, call.from_user.last_name)
 
-    # vote:{mid}:{bet_type}:{choice}
     _, mid, bt, choice = call.data.split(":", 3)
     mid = int(mid)
 
@@ -745,7 +783,7 @@ async def vote_cb(call: CallbackQuery):
     ensure_score_row(season, call.from_user.id, call.from_user.username)
 
     with db() as con:
-        st = con.execute("SELECT status, title FROM matches WHERE id=?", (mid,)).fetchone()
+        st = con.execute("SELECT status FROM matches WHERE id=?", (mid,)).fetchone()
         if not st:
             await call.answer("Матч не найден.", show_alert=True)
             return
@@ -760,14 +798,12 @@ async def vote_cb(call: CallbackQuery):
         con.commit()
 
     await call.answer(f"Сохранено: {BET_LABEL.get(bt, bt)} ✅", show_alert=True)
-
-    # достижение "first_pred" проверим отдельно (Layer 3 + уведомления Layer 2)
-    bot = call.bot
-    await check_and_notify_achievements(bot, season, call.from_user.id)
+    await check_and_notify_achievements(call.bot, season, call.from_user.id)
 
 @dp.message(F.text == BTN_MY)
 async def my_votes(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, None)
 
     with db() as con:
         rows = con.execute("""
@@ -793,6 +829,7 @@ async def my_votes(message: Message):
 @dp.message(F.text == BTN_LB)
 async def leaderboard(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, None)
 
     season = current_season()
     with db() as con:
@@ -816,13 +853,61 @@ async def leaderboard(message: Message):
         correct = int(r["correct"])
         acc = (correct / total * 100) if total else 0.0
         text += f"\n{i}. {name} — {int(r['points'])} pts | {acc:.0f}%"
-
     await message.answer(text, reply_markup=main_menu_kb(is_admin(message.from_user.id)))
 
 @dp.message(F.text == BTN_PROFILE)
 async def my_profile(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, None)
     await send_profile(message, message.from_user.id)
+
+# ===== Find player flow =====
+@dp.message(F.text == BTN_FIND)
+async def find_player_start(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, "await_find_username")
+    await message.answer(
+        "🔎 Напиши @username игрока (или просто username).\n\n"
+        "Важно: игрок должен хотя бы раз запустить бота, чтобы появился в базе.",
+        reply_markup=main_menu_kb(is_admin(message.from_user.id))
+    )
+
+@dp.message(Command("find"))
+async def find_player_cmd(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        set_state(message.from_user.id, "await_find_username")
+        await message.answer("Напиши @username игрока (или просто username).")
+        return
+
+    username = parts[1].strip()
+    uid = find_user_by_username(username)
+    if not uid:
+        await message.answer("Не нашёл такого игрока. Проверь @username.")
+        return
+
+    set_state(message.from_user.id, None)
+    await send_profile(message, uid)
+
+@dp.message()
+async def state_router(message: Message):
+    st = get_state(message.from_user.id)
+    if st != "await_find_username":
+        return
+
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+
+    username = (message.text or "").strip()
+    uid = find_user_by_username(username)
+    set_state(message.from_user.id, None)
+
+    if not uid:
+        await message.answer("Не нашёл такого игрока. Попробуй ещё раз: @username")
+        return
+
+    await send_profile(message, uid)
 
 async def send_profile(message_or_call, target_user_id: int):
     season = current_season()
@@ -839,10 +924,8 @@ async def send_profile(message_or_call, target_user_id: int):
 
     if isinstance(message_or_call, Message):
         await message_or_call.answer(text, reply_markup=main_menu_kb(is_admin(message_or_call.from_user.id)), disable_web_page_preview=True)
-        # отдельно кнопки профиля — в инлайне:
         await message_or_call.answer("Действия:", reply_markup=profile_kb(message_or_call.from_user.id, target_user_id))
     else:
-        # callback query
         await message_or_call.message.edit_text(text, reply_markup=profile_kb(viewer_id, target_user_id), disable_web_page_preview=True)
 
 @dp.callback_query(F.data.startswith("follow:"))
@@ -861,13 +944,16 @@ async def follow_cb(call: CallbackQuery):
             await call.answer("Ты уже подписан.", show_alert=True)
         else:
             await call.answer("Подписка оформлена ⭐", show_alert=True)
-            # Уведомление цели (Layer 2)
-            await safe_dm(call.bot, target_id, f"⭐ У тебя новый подписчик: @{call.from_user.username}" if call.from_user.username else "⭐ У тебя новый подписчик!")
+            await safe_dm(
+                call.bot,
+                target_id,
+                f"⭐ У тебя новый подписчик: @{call.from_user.username}" if call.from_user.username else "⭐ У тебя новый подписчик!"
+            )
     else:
         unfollow_user(call.from_user.id, target_id)
         await call.answer("Отписался ✅", show_alert=True)
 
-    # обновим карточку профиля
+    # refresh profile card in the same message
     season = current_season()
     urow, srow = get_profile(season, target_id)
     if not urow:
@@ -891,20 +977,17 @@ async def share_profile(call: CallbackQuery):
 @dp.message(F.text == BTN_HELP)
 async def help_menu(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    set_state(message.from_user.id, None)
 
     await message.answer(
         "ℹ️ Помощь\n\n"
-        "1) «⚽ Активные матчи» → выбери матч (🏟 #...)\n"
-        "2) «🗳 Сделать прогноз» → выбери тип → исход кнопками\n"
-        "3) «📈 Статистика» — смотри проценты по матчу\n"
-        "4) «🏆 Лидерборд» — сезонный топ\n"
-        "5) «👤 Профиль» — твоя публичная карточка\n\n"
-        "📩 Уведомления приходят в ЛС, когда:\n"
-        "• ты получил достижение\n"
-        "• тебе начислили очки по результату матча\n"
-        "• на тебя подписались\n"
-        "• ты поднялся в рейтинге\n\n"
-        "Команда админа:\n"
+        "• «⚽ Активные матчи» → выбирай матч → прогноз/статистика\n"
+        "• «🏆 Лидерборд» — топ сезона\n"
+        "• «👤 Профиль» — твой профиль\n"
+        "• «🔎 Найти игрока» — поиск по @username\n\n"
+        "Можно также:\n"
+        "/find @username\n\n"
+        "Админ:\n"
         "/newmatch <название>",
         reply_markup=main_menu_kb(is_admin(message.from_user.id))
     )
@@ -933,7 +1016,7 @@ async def newmatch_cmd(message: Message):
 
     await message.answer("Матч создан ✅\nНажми «⚽ Активные матчи», чтобы увидеть его в списке.")
 
-# ===== ADMIN actions per match =====
+# ===== Admin actions (close / set result) =====
 @dp.callback_query(F.data.startswith("admin:"))
 async def admin_actions(call: CallbackQuery):
     upsert_user(call.from_user.id, call.from_user.username, call.from_user.first_name, call.from_user.last_name)
@@ -985,7 +1068,6 @@ async def choose_type_setres(call: CallbackQuery):
         await call.message.edit_text("Поставь результат (тотал):", reply_markup=kb_total(mid, "setr"))
     elif bt == "btts":
         await call.message.edit_text("Поставь результат (обе забьют):", reply_markup=kb_btts(mid, "setr"))
-
     await call.answer()
 
 @dp.callback_query(F.data.startswith("setr:"))
@@ -996,7 +1078,6 @@ async def set_result_cb(call: CallbackQuery):
         await call.answer("Только для админа.", show_alert=True)
         return
 
-    # setr:{mid}:{bet_type}:{result}
     _, mid, bt, result = call.data.split(":", 3)
     mid = int(mid)
 
@@ -1005,7 +1086,6 @@ async def set_result_cb(call: CallbackQuery):
         await call.answer("Матч не найден.", show_alert=True)
         return
 
-    # для уведомлений: статистика по матчу (до начисления)
     totals_map, data = match_stats(mid)
     total_this_type = totals_map.get(bt, 0)
     dist = data.get(bt, {})
@@ -1018,7 +1098,6 @@ async def set_result_cb(call: CallbackQuery):
         await call.answer("Матч не найден.", show_alert=True)
         return
 
-    # Уведомления (Layer 2): всем, кто голосовал по этому типу — исход и очки
     season = current_season()
     with db() as con:
         voters = con.execute("""
@@ -1027,28 +1106,22 @@ async def set_result_cb(call: CallbackQuery):
             WHERE match_id=? AND bet_type=?
         """, (mid, bt)).fetchall()
 
-        # обновим ranks/achievements после начислений
         bot = call.bot
-
         for v in voters:
             uid = int(v["user_id"])
-            uname = v["username"]
             ch = v["choice"]
             correct = (ch == result)
 
-            # место/очки/серия после начисления
             srow = con.execute("""
-                SELECT points, correct, total, streak
+                SELECT points, streak
                 FROM scores_season WHERE season=? AND user_id=?
             """, (season, uid)).fetchone()
 
             pts = int(srow["points"]) if srow else 0
             streak = int(srow["streak"]) if srow else 0
 
-            # распределение толпы
             crowd_line = ""
             if total_this_type > 0:
-                # соберём самые популярные 2
                 ordered = sorted(dist.items(), key=lambda x: (-x[1], x[0]))[:3]
                 parts = []
                 for opt, cnt in ordered:
@@ -1069,8 +1142,6 @@ async def set_result_cb(call: CallbackQuery):
                 text += "\n" + crowd_line
 
             await safe_dm(bot, uid, text)
-
-            # ачивки + изменение ранга
             await check_and_notify_achievements(bot, season, uid)
             await notify_rank_change(bot, season, uid)
 
