@@ -4,7 +4,6 @@ import logging
 import os
 import sqlite3
 import threading
-import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -49,17 +48,6 @@ except Exception:
     AUTO_SYNC_HOUR_LOCAL = 4
 
 CRON_SECRET = (os.getenv("CRON_SECRET") or "").strip()
-
-# Close predictions N seconds before kickoff (default: 120s = 2 minutes)
-try:
-    PREDICTION_CLOSE_SECONDS = int((os.getenv("PREDICTION_CLOSE_SECONDS") or "120").strip())
-except Exception:
-    PREDICTION_CLOSE_SECONDS = 120
-# safety bounds
-if PREDICTION_CLOSE_SECONDS < 30:
-    PREDICTION_CLOSE_SECONDS = 30
-if PREDICTION_CLOSE_SECONDS > 600:
-    PREDICTION_CLOSE_SECONDS = 600
 # =======================================================
 
 dp = Dispatcher()
@@ -124,66 +112,7 @@ def today_key_utc() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
 
 def current_season() -> str:
-    return datetime.utcnow().strftime
-def _parse_iso_utc(dt_str: str) -> Optional[datetime]:
-    """Parses ISO datetime that may end with 'Z' into aware UTC datetime."""
-    s = (dt_str or "").strip()
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        d = datetime.fromisoformat(s)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def _parse_kickoff_from_title(title: str) -> Optional[str]:
-    """
-    Optional helper for manual matches:
-    if title contains '(HH:MM)' — we assume kickoff is today in AUTO_SYNC_TZ if set, otherwise UTC.
-    Returns kickoff_utc as ISO string with offset (e.g. 2026-02-03T18:00:00+00:00).
-    """
-    t = (title or "")
-    mm = re.findall(r"\((\d{1,2}):(\d{2})\)", t)
-    if not mm:
-        return None
-    hh, mi = mm[-1]
-    try:
-        hh_i = int(hh); mi_i = int(mi)
-        if not (0 <= hh_i <= 23 and 0 <= mi_i <= 59):
-            return None
-    except Exception:
-        return None
-
-    tz = ZoneInfo(AUTO_SYNC_TZ) if AUTO_SYNC_TZ else timezone.utc
-    now_local = datetime.now(tz)
-    kickoff_local = now_local.replace(hour=hh_i, minute=mi_i, second=0, microsecond=0)
-    if kickoff_local <= now_local:
-        kickoff_local += timedelta(days=1)
-
-    kickoff_utc = kickoff_local.astimezone(timezone.utc)
-    return kickoff_utc.isoformat(timespec="seconds")
-
-def can_predict_for_match(mid: int) -> Tuple[bool, Optional[int]]:
-    """
-    Returns (allowed, seconds_left_to_lock). If kickoff is unknown -> allowed.
-    Lock moment = kickoff_utc - PREDICTION_CLOSE_SECONDS.
-    """
-    m = get_match(mid)
-    if not m:
-        return False, None
-    kickoff = _parse_iso_utc(m.get("kickoff_utc") or "")
-    if not kickoff:
-        return True, None
-    lock_at = kickoff - timedelta(seconds=PREDICTION_CLOSE_SECONDS)
-    nowu = datetime.now(timezone.utc)
-    if nowu >= lock_at:
-        return False, 0
-    return True, int((lock_at - nowu).total_seconds())
-("%Y-%m")
+    return datetime.utcnow().strftime("%Y-%m")
 
 def is_admin(uid: int) -> bool:
     return ADMIN_ID != 0 and int(uid) == int(ADMIN_ID)
@@ -209,16 +138,9 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'open',
             is_featured INTEGER NOT NULL DEFAULT 0,
             bonus_multiplier REAL NOT NULL DEFAULT 1.0,
-            kickoff_utc TEXT,
             external_id TEXT
         )
         """)
-
-        # DB migration: add kickoff_utc column for old databases
-        try:
-            con.execute("ALTER TABLE matches ADD COLUMN kickoff_utc TEXT")
-        except Exception:
-            pass
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_external_id ON matches(external_id)")
 
         con.execute("""
@@ -425,7 +347,7 @@ def set_last_rank(user_id: int, rank: Optional[int]):
 def get_open_matches():
     with db() as con:
         return con.execute("""
-            SELECT id, title, status, is_featured, bonus_multiplier, kickoff_utc
+            SELECT id, title, status, is_featured, bonus_multiplier
             FROM matches
             WHERE status='open'
             ORDER BY is_featured DESC, id DESC
@@ -434,7 +356,7 @@ def get_open_matches():
 def get_match(mid: int):
     with db() as con:
         return con.execute("""
-            SELECT id, title, status, is_featured, bonus_multiplier, kickoff_utc, external_id
+            SELECT id, title, status, is_featured, bonus_multiplier, external_id
             FROM matches WHERE id=?
         """, (mid,)).fetchone()
 
@@ -448,12 +370,12 @@ def match_exists_by_ext(ext_id: str) -> bool:
         r = con.execute("SELECT 1 FROM matches WHERE external_id=?", (ext_id,)).fetchone()
         return r is not None
 
-def create_match(title: str, featured: int = 0, mult: float = 1.0, external_id: Optional[str] = None, kickoff_utc: Optional[str] = None) -> int:
+def create_match(title: str, featured: int = 0, mult: float = 1.0, external_id: Optional[str] = None) -> int:
     with db() as con:
         cur = con.execute("""
-            INSERT INTO matches(title, status, is_featured, bonus_multiplier, external_id, kickoff_utc)
-            VALUES(?, 'open', ?, ?, ?, ?)
-        """, (title, int(featured), float(mult), external_id, kickoff_utc))
+            INSERT INTO matches(title, status, is_featured, bonus_multiplier, external_id)
+            VALUES(?, 'open', ?, ?, ?)
+        """, (title, int(featured), float(mult), external_id))
         con.commit()
         return int(cur.lastrowid)
 
@@ -1355,10 +1277,6 @@ async def match_menu(call: CallbackQuery):
         if row["status"] != "open":
             await call.answer("Матч закрыт для прогнозов.", show_alert=True)
             return
-        allowed, _secs = can_predict_for_match(mid)
-        if not allowed:
-            await call.answer("Прогнозы закрыты (до матча осталось меньше 1–2 минут).", show_alert=True)
-            return
         await call.message.edit_text(
             f"Матч #{mid}: {row['title']}\n\nВыбери тип прогноза:",
             reply_markup=bet_type_kb(mid, mode="vote")
@@ -1381,10 +1299,6 @@ async def choose_type_vote(call: CallbackQuery):
     if not m or m["status"] != "open":
         await call.answer("Матч закрыт/не найден.", show_alert=True)
         return
-    allowed, _secs = can_predict_for_match(mid)
-    if not allowed:
-        await call.answer("Прогнозы закрыты (до матча осталось меньше 1–2 минут).", show_alert=True)
-        return
 
     if bt == "1x2":
         await call.message.edit_text("Выбери исход 1X2:", reply_markup=kb_1x2(mid, "vote"))
@@ -1405,10 +1319,6 @@ async def vote_cb(call: CallbackQuery):
     m = get_match(mid)
     if not m or m["status"] != "open":
         await call.answer("Матч закрыт.", show_alert=True)
-        return
-    allowed, _secs = can_predict_for_match(mid)
-    if not allowed:
-        await call.answer("Прогнозы закрыты (до матча осталось меньше 1–2 минут).", show_alert=True)
         return
 
     season = current_season()
@@ -1641,8 +1551,7 @@ async def newmatch_cmd(message: Message):
     if not title:
         await message.answer("Формат: /newmatch <название>")
         return
-    kickoff_utc = _parse_kickoff_from_title(title)
-    mid = create_match(title, kickoff_utc=kickoff_utc)
+    mid = create_match(title)
     await message.answer(f"Матч создан ✅ #{mid}")
 
 @dp.message(Command("newfeatured"))
@@ -1660,8 +1569,7 @@ async def newfeatured_cmd(message: Message):
         await message.answer("Множитель должен быть числом")
         return
     title = parts[2].strip()
-    kickoff_utc = _parse_kickoff_from_title(title)
-    mid = create_match(title, featured=1, mult=mult, kickoff_utc=kickoff_utc)
+    mid = create_match(title, featured=1, mult=mult)
     await message.answer(f"⭐ Матч дня создан ✅ #{mid} (x{mult:g})")
 
 @dp.message(Command("sync_today"))
@@ -1701,14 +1609,14 @@ async def pending_fixture_actions(call: CallbackQuery):
         return
 
     if action == "add":
-        create_match(p["title"], featured=0, mult=1.0, external_id=p["ext_id"], kickoff_utc=p["kickoff_utc"])
+        create_match(p["title"], featured=0, mult=1.0, external_id=p["ext_id"])
         pending_delete(pid)
         await call.message.edit_text(call.message.text + "\n\n✅ Добавлено в активные матчи")
         await call.answer()
         return
 
     if action == "feat":
-        create_match(p["title"], featured=1, mult=mult, external_id=p["ext_id"], kickoff_utc=p["kickoff_utc"])
+        create_match(p["title"], featured=1, mult=mult, external_id=p["ext_id"])
         pending_delete(pid)
         await call.message.edit_text(call.message.text + f"\n\n⭐ Добавлено как Матч дня (x{mult:g})")
         await call.answer()
