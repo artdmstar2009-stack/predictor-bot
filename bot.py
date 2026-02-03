@@ -1026,6 +1026,10 @@ async def sync_today_internal(bot: Bot, requested_by: str = "auto"):
     comps = set(x.strip() for x in FD_COMPETITIONS.split(",") if x.strip())
     sent = 0
     skipped = 0
+    skipped_started = 0
+
+    now_utc = datetime.now(timezone.utc)
+    close_delta = timedelta(seconds=PREDICTION_CLOSE_SECONDS)
 
     await safe_dm(bot, ADMIN_ID, f"🕓 Лондон 04:00 → синк матчей на {day} ({requested_by})\nК подтверждению отправляю карточки…")
 
@@ -1048,6 +1052,12 @@ async def sync_today_internal(bot: Bot, requested_by: str = "auto"):
 
         title = f"{home} vs {away}"
         kickoff = (m.get("utcDate") or "").strip()
+
+        kdt = _parse_iso_utc(kickoff)
+        # Don't propose matches that already started or are within the close window
+        if kdt and kdt <= (now_utc + close_delta):
+            skipped_started += 1
+            continue
 
         pid = pending_save(ext_id, day, title, kickoff, comp_code)
         if not pid:
