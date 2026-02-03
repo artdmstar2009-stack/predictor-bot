@@ -1295,6 +1295,22 @@ async def whoami(message: Message):
         f"FD_COMPETITIONS: {FD_COMPETITIONS or '(пусто)'}"
     )
 
+@dp.message(Command("sync_today"))
+async def cmd_sync_today(message: Message):
+    """Ручной запуск синка матчей с football-data (только админ).
+    Присылает админу карточки матчей на подтверждение (Добавить / Матч дня / Пропустить).
+    """
+    upsert_user(message)
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только админ.")
+        return
+
+    await message.answer("🔄 Ок, собираю матчи на сегодня и пришлю тебе карточки на подтверждение…")
+    try:
+        await sync_today_internal(message.bot, requested_by="manual")
+    except Exception as e:
+        logging.exception("sync_today failed")
+        await message.answer(f"⚠️ Ошибка /sync_today: {e}")
 @dp.message(F.text == BTN_BACK)
 async def back_to_main(message: Message):
     upsert_user(message)
