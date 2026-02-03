@@ -4,6 +4,7 @@ import logging
 import os
 import sqlite3
 import threading
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -48,6 +49,17 @@ except Exception:
     AUTO_SYNC_HOUR_LOCAL = 4
 
 CRON_SECRET = (os.getenv("CRON_SECRET") or "").strip()
+
+# Close predictions N seconds before kickoff (default: 120s = 2 minutes)
+try:
+    PREDICTION_CLOSE_SECONDS = int((os.getenv("PREDICTION_CLOSE_SECONDS") or "120").strip())
+except Exception:
+    PREDICTION_CLOSE_SECONDS = 120
+# safety bounds
+if PREDICTION_CLOSE_SECONDS < 30:
+    PREDICTION_CLOSE_SECONDS = 30
+if PREDICTION_CLOSE_SECONDS > 600:
+    PREDICTION_CLOSE_SECONDS = 600
 # =======================================================
 
 dp = Dispatcher()
@@ -112,7 +124,66 @@ def today_key_utc() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
 
 def current_season() -> str:
-    return datetime.utcnow().strftime("%Y-%m")
+    return datetime.utcnow().strftime
+def _parse_iso_utc(dt_str: str) -> Optional[datetime]:
+    """Parses ISO datetime that may end with 'Z' into aware UTC datetime."""
+    s = (dt_str or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _parse_kickoff_from_title(title: str) -> Optional[str]:
+    """
+    Optional helper for manual matches:
+    if title contains '(HH:MM)' — we assume kickoff is today in AUTO_SYNC_TZ if set, otherwise UTC.
+    Returns kickoff_utc as ISO string with offset (e.g. 2026-02-03T18:00:00+00:00).
+    """
+    t = (title or "")
+    mm = re.findall(r"\((\d{1,2}):(\d{2})\)", t)
+    if not mm:
+        return None
+    hh, mi = mm[-1]
+    try:
+        hh_i = int(hh); mi_i = int(mi)
+        if not (0 <= hh_i <= 23 and 0 <= mi_i <= 59):
+            return None
+    except Exception:
+        return None
+
+    tz = ZoneInfo(AUTO_SYNC_TZ) if AUTO_SYNC_TZ else timezone.utc
+    now_local = datetime.now(tz)
+    kickoff_local = now_local.replace(hour=hh_i, minute=mi_i, second=0, microsecond=0)
+    if kickoff_local <= now_local:
+        kickoff_local += timedelta(days=1)
+
+    kickoff_utc = kickoff_local.astimezone(timezone.utc)
+    return kickoff_utc.isoformat(timespec="seconds")
+
+def can_predict_for_match(mid: int) -> Tuple[bool, Optional[int]]:
+    """
+    Returns (allowed, seconds_left_to_lock). If kickoff is unknown -> allowed.
+    Lock moment = kickoff_utc - PREDICTION_CLOSE_SECONDS.
+    """
+    m = get_match(mid)
+    if not m:
+        return False, None
+    kickoff = _parse_iso_utc(m.get("kickoff_utc") or "")
+    if not kickoff:
+        return True, None
+    lock_at = kickoff - timedelta(seconds=PREDICTION_CLOSE_SECONDS)
+    nowu = datetime.now(timezone.utc)
+    if nowu >= lock_at:
+        return False, 0
+    return True, int((lock_at - nowu).total_seconds())
+("%Y-%m")
 
 def is_admin(uid: int) -> bool:
     return ADMIN_ID != 0 and int(uid) == int(ADMIN_ID)
@@ -138,9 +209,16 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'open',
             is_featured INTEGER NOT NULL DEFAULT 0,
             bonus_multiplier REAL NOT NULL DEFAULT 1.0,
+            kickoff_utc TEXT,
             external_id TEXT
         )
         """)
+
+        # DB migration: add kickoff_utc column for old databases
+        try:
+            con.execute("ALTER TABLE matches ADD COLUMN kickoff_utc TEXT")
+        except Exception:
+            pass
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_external_id ON matches(external_id)")
 
         con.execute("""
@@ -347,7 +425,7 @@ def set_last_rank(user_id: int, rank: Optional[int]):
 def get_open_matches():
     with db() as con:
         return con.execute("""
-            SELECT id, title, status, is_featured, bonus_multiplier
+            SELECT id, title, status, is_featured, bonus_multiplier, kickoff_utc
             FROM matches
             WHERE status='open'
             ORDER BY is_featured DESC, id DESC
@@ -356,7 +434,7 @@ def get_open_matches():
 def get_match(mid: int):
     with db() as con:
         return con.execute("""
-            SELECT id, title, status, is_featured, bonus_multiplier, external_id
+            SELECT id, title, status, is_featured, bonus_multiplier, kickoff_utc, external_id
             FROM matches WHERE id=?
         """, (mid,)).fetchone()
 
@@ -370,12 +448,12 @@ def match_exists_by_ext(ext_id: str) -> bool:
         r = con.execute("SELECT 1 FROM matches WHERE external_id=?", (ext_id,)).fetchone()
         return r is not None
 
-def create_match(title: str, featured: int = 0, mult: float = 1.0, external_id: Optional[str] = None) -> int:
+def create_match(title: str, featured: int = 0, mult: float = 1.0, external_id: Optional[str] = None, kickoff_utc: Optional[str] = None) -> int:
     with db() as con:
         cur = con.execute("""
-            INSERT INTO matches(title, status, is_featured, bonus_multiplier, external_id)
-            VALUES(?, 'open', ?, ?, ?)
-        """, (title, int(featured), float(mult), external_id))
+            INSERT INTO matches(title, status, is_featured, bonus_multiplier, external_id, kickoff_utc)
+            VALUES(?, 'open', ?, ?, ?, ?)
+        """, (title, int(featured), float(mult), external_id, kickoff_utc))
         con.commit()
         return int(cur.lastrowid)
 
@@ -993,7 +1071,6 @@ BTN_LB = "🏆 Лидерборд"
 BTN_PROFILE = "👤 Профиль"
 BTN_FIND = "🔎 Найти игрока"
 BTN_HELP = "ℹ️ Помощь"
-BTN_NEW = "➕ Создать матч"
 BTN_BACK = "⬅️ Назад"
 
 def main_menu_kb(user_is_admin: bool):
@@ -1004,8 +1081,6 @@ def main_menu_kb(user_is_admin: bool):
     kb.button(text=BTN_PROFILE)
     kb.button(text=BTN_FIND)
     kb.button(text=BTN_HELP)
-    if user_is_admin:
-        kb.button(text=BTN_NEW)
     kb.adjust(2)
     return kb.as_markup(resize_keyboard=True)
 
@@ -1017,8 +1092,6 @@ def matches_list_kb(matches, user_is_admin: bool):
         bonus = f"(x{mult:g}) " if int(r["is_featured"]) == 1 and mult != 1.0 else ""
         kb.button(text=f"🏟 #{r['id']} {star}{bonus}{r['title']}")
     kb.button(text=BTN_BACK)
-    if user_is_admin:
-        kb.button(text=BTN_NEW)
     kb.adjust(1)
     return kb.as_markup(resize_keyboard=True)
 
@@ -1277,6 +1350,10 @@ async def match_menu(call: CallbackQuery):
         if row["status"] != "open":
             await call.answer("Матч закрыт для прогнозов.", show_alert=True)
             return
+        allowed, _secs = can_predict_for_match(mid)
+        if not allowed:
+            await call.answer("Прогнозы закрыты (до матча осталось меньше 1–2 минут).", show_alert=True)
+            return
         await call.message.edit_text(
             f"Матч #{mid}: {row['title']}\n\nВыбери тип прогноза:",
             reply_markup=bet_type_kb(mid, mode="vote")
@@ -1299,6 +1376,10 @@ async def choose_type_vote(call: CallbackQuery):
     if not m or m["status"] != "open":
         await call.answer("Матч закрыт/не найден.", show_alert=True)
         return
+    allowed, _secs = can_predict_for_match(mid)
+    if not allowed:
+        await call.answer("Прогнозы закрыты (до матча осталось меньше 1–2 минут).", show_alert=True)
+        return
 
     if bt == "1x2":
         await call.message.edit_text("Выбери исход 1X2:", reply_markup=kb_1x2(mid, "vote"))
@@ -1319,6 +1400,10 @@ async def vote_cb(call: CallbackQuery):
     m = get_match(mid)
     if not m or m["status"] != "open":
         await call.answer("Матч закрыт.", show_alert=True)
+        return
+    allowed, _secs = can_predict_for_match(mid)
+    if not allowed:
+        await call.answer("Прогнозы закрыты (до матча осталось меньше 1–2 минут).", show_alert=True)
         return
 
     season = current_season()
@@ -1509,9 +1594,7 @@ async def help_menu(message: Message):
         "• «👤 Профиль» — профиль + задания + дуэли\n"
         "• «🔎 Найти игрока» — поиск по @username\n\n"
         "Админ:\n"
-        "/newmatch <название>\n"
-        "/newfeatured <множитель> <название>\n"
-        "/sync_today (ручной)\n"
+                        "/sync_today (ручной)\n"
         "/whoami (диагностика)\n",
         reply_markup=main_menu_kb(is_admin(message.from_user.id))
     )
@@ -1527,57 +1610,8 @@ async def task_claim(call: CallbackQuery):
     await notify_rank_change(call.bot, season, call.from_user.id)
     await send_profile(call.message, call.from_user.id)
 
-@dp.message(F.text == BTN_NEW)
-async def newmatch_hint(message: Message):
-    upsert_user(message)
-    if not is_admin(message.from_user.id):
-        return
-    await message.answer(
-        "Создай матч:\n"
-        "/newmatch Real vs Barca (20:00)\n\n"
-        "Матч дня:\n"
-        "/newfeatured 2 Real vs Barca\n\n"
-        "Авто-матчи на сегодня:\n"
-        "/sync_today",
-        reply_markup=main_menu_kb(True)
-    )
 
-@dp.message(Command("newmatch"))
-async def newmatch_cmd(message: Message):
-    upsert_user(message)
-    if not is_admin(message.from_user.id):
-        return
-    title = (message.text or "").replace("/newmatch", "", 1).strip()
-    if not title:
-        await message.answer("Формат: /newmatch <название>")
-        return
-    mid = create_match(title)
-    await message.answer(f"Матч создан ✅ #{mid}")
 
-@dp.message(Command("newfeatured"))
-async def newfeatured_cmd(message: Message):
-    upsert_user(message)
-    if not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Формат: /newfeatured <множитель> <название>")
-        return
-    try:
-        mult = float(parts[1])
-    except Exception:
-        await message.answer("Множитель должен быть числом")
-        return
-    title = parts[2].strip()
-    mid = create_match(title, featured=1, mult=mult)
-    await message.answer(f"⭐ Матч дня создан ✅ #{mid} (x{mult:g})")
-
-@dp.message(Command("sync_today"))
-async def sync_today_cmd(message: Message):
-    upsert_user(message)
-    if not is_admin(message.from_user.id):
-        return
-    await sync_today_internal(message.bot, requested_by="manual")
 
 @dp.callback_query(F.data.startswith("pf:"))
 async def pending_fixture_actions(call: CallbackQuery):
@@ -1609,14 +1643,14 @@ async def pending_fixture_actions(call: CallbackQuery):
         return
 
     if action == "add":
-        create_match(p["title"], featured=0, mult=1.0, external_id=p["ext_id"])
+        create_match(p["title"], featured=0, mult=1.0, external_id=p["ext_id"], kickoff_utc=p["kickoff_utc"])
         pending_delete(pid)
         await call.message.edit_text(call.message.text + "\n\n✅ Добавлено в активные матчи")
         await call.answer()
         return
 
     if action == "feat":
-        create_match(p["title"], featured=1, mult=mult, external_id=p["ext_id"])
+        create_match(p["title"], featured=1, mult=mult, external_id=p["ext_id"], kickoff_utc=p["kickoff_utc"])
         pending_delete(pid)
         await call.message.edit_text(call.message.text + f"\n\n⭐ Добавлено как Матч дня (x{mult:g})")
         await call.answer()
@@ -1977,6 +2011,149 @@ async def auto_sync_loop(bot: Bot):
             await asyncio.sleep(10)
 
 
+
+# ===================== Auto close + auto settle (football-data) =====================
+def fetch_match_from_fd(ext_id: str) -> dict:
+    if not FOOTBALL_DATA_TOKEN:
+        return {"__error__": "FOOTBALL_DATA_TOKEN not set"}
+    ext_id = (ext_id or "").strip()
+    if not ext_id:
+        return {"__error__": "empty external id"}
+    url = f"https://api.football-data.org/v4/matches/{ext_id}"
+    req = Request(url, headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN, "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=25) as r:
+            raw = r.read().decode("utf-8")
+            return json.loads(raw)
+    except Exception as e:
+        logging.exception("football-data match fetch failed")
+        return {"__error__": str(e), "__url__": url}
+
+def mark_match_finished(mid: int):
+    with db() as con:
+        con.execute("UPDATE matches SET status='finished' WHERE id=?", (mid,))
+        con.commit()
+
+def list_matches_for_autoprocess() -> list:
+    with db() as con:
+        return con.execute("""
+            SELECT id, title, status, kickoff_utc, external_id
+            FROM matches
+            WHERE external_id IS NOT NULL AND TRIM(external_id) != ''
+              AND status IN ('open','closed','finished')
+            ORDER BY id DESC
+        """).fetchall()
+
+def _derive_results_from_finished_fd(match_json: dict) -> Optional[dict]:
+    try:
+        m = match_json.get("match") or match_json  # some wrappers return {"match": {...}}
+        status = (m.get("status") or "").upper()
+        if status != "FINISHED":
+            return None
+        score = m.get("score") or {}
+        ft = (score.get("fullTime") or {})
+        hg = ft.get("home")
+        ag = ft.get("away")
+        if hg is None or ag is None:
+            return None
+        hg = int(hg); ag = int(ag)
+    except Exception:
+        return None
+
+    if hg > ag:
+        r_1x2 = "home"
+    elif hg < ag:
+        r_1x2 = "away"
+    else:
+        r_1x2 = "draw"
+
+    r_score = f"{hg}:{ag}"
+    r_total = "over" if (hg + ag) >= 3 else "under"
+    r_btts = "yes" if (hg > 0 and ag > 0) else "no"
+
+    return {"1x2": r_1x2, "score": r_score, "total": r_total, "btts": r_btts}
+
+async def notify_users_about_result(bot: Bot, mid: int, bt: str, result: str, points_per_win: int):
+    m = get_match(mid)
+    if not m:
+        return
+    title = m["title"]
+    with db() as con:
+        voters = con.execute("""
+            SELECT user_id, choice
+            FROM votes
+            WHERE match_id=? AND bet_type=?
+        """, (mid, bt)).fetchall()
+
+    for r in voters:
+        uid = int(r["user_id"])
+        ch = r["choice"]
+        correct = (ch == result)
+        msg = (
+            f"🏁 Итоги матча: {title}\n"
+            f"Тип: {BET_LABEL.get(bt, bt)}\n"
+            f"Результат: {choice_label(bt, result)}\n"
+            f"Твой прогноз: {choice_label(bt, ch)}\n"
+            f"{'✅ Верно' if correct else '❌ Мимо'}"
+        )
+        if correct and points_per_win:
+            msg += f" (+{points_per_win} очков)"
+        await safe_dm(bot, uid, msg)
+        await asyncio.sleep(0.05)
+
+async def auto_close_and_settle_loop(bot: Bot):
+    await asyncio.sleep(3)
+
+    while True:
+        try:
+            rows = list_matches_for_autoprocess()
+            nowu = datetime.now(timezone.utc)
+
+            for r in rows:
+                mid = int(r["id"])
+                status = (r["status"] or "").strip().lower()
+                kickoff = _parse_iso_utc(r["kickoff_utc"] or "")
+                ext_id = (r["external_id"] or "").strip()
+
+                # 1) Auto close predictions
+                if status == "open" and kickoff:
+                    lock_at = kickoff - timedelta(seconds=PREDICTION_CLOSE_SECONDS)
+                    if nowu >= lock_at:
+                        close_match(mid)
+
+                # 2) Auto settle finished matches
+                if not ext_id:
+                    continue
+
+                if kickoff and nowu < (kickoff - timedelta(minutes=5)):
+                    continue
+
+                fd = fetch_match_from_fd(ext_id)
+                if fd.get("__error__"):
+                    continue
+
+                results = _derive_results_from_finished_fd(fd)
+                if not results:
+                    continue
+
+                for bt in ["1x2", "score", "total", "btts"]:
+                    res = results.get(bt)
+                    if not res:
+                        continue
+                    status_text, winners_count, points_per_win = set_result_and_score(mid, bt, res)
+                    if "уже" in status_text.lower():
+                        continue
+                    await notify_users_about_result(bot, mid, bt, res, points_per_win)
+                    settle_duels_for_result(bot, mid, bt, res)
+
+                if status != "finished":
+                    mark_match_finished(mid)
+
+            await asyncio.sleep(60)
+        except Exception:
+            logging.exception("auto_close_and_settle_loop crashed")
+            await asyncio.sleep(15)
+
 # ===================== MAIN =====================
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -1994,6 +2171,7 @@ async def main():
     BOT_USERNAME = me.username
 
     asyncio.create_task(auto_sync_loop(bot))
+    asyncio.create_task(auto_close_and_settle_loop(bot))
 
     await dp.start_polling(bot)
 
