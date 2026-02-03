@@ -124,7 +124,12 @@ def today_key_utc() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
 
 def current_season() -> str:
-    return datetime.utcnow().strftime
+    """Season key used for leaderboards/duels.
+
+    We keep it as a simple calendar year string to avoid ambiguity.
+    """
+    return datetime.utcnow().strftime("%Y")
+
 def _parse_iso_utc(dt_str: str) -> Optional[datetime]:
     """Parses ISO datetime that may end with 'Z' into aware UTC datetime."""
     s = (dt_str or "").strip()
