@@ -11,6 +11,8 @@ from typing import Optional, Tuple, List
 from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.request import Request, urlopen
 
+from zoneinfo import ZoneInfo
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
@@ -31,10 +33,19 @@ FOOTBALL_DATA_TOKEN = (os.getenv("FOOTBALL_DATA_TOKEN") or "").strip()
 FD_COMPETITIONS = (os.getenv("FD_COMPETITIONS") or "").strip()  # "PL,CL,PD"
 
 AUTO_SYNC_ENABLED = (os.getenv("AUTO_SYNC_ENABLED") or "0").strip() == "1"
+
+# OLD mode (UTC hour), kept for backward compatibility
 try:
-    AUTO_SYNC_HOUR_UTC = int((os.getenv("AUTO_SYNC_HOUR_UTC") or "8").strip())  # 08:00 UTC
+    AUTO_SYNC_HOUR_UTC = int((os.getenv("AUTO_SYNC_HOUR_UTC") or "8").strip())  # default 08:00 UTC
 except Exception:
     AUTO_SYNC_HOUR_UTC = 8
+
+# NEW mode (local timezone + local hour) for "04:00 London" with DST support
+AUTO_SYNC_TZ = (os.getenv("AUTO_SYNC_TZ") or "").strip()  # e.g. "Europe/London"
+try:
+    AUTO_SYNC_HOUR_LOCAL = int((os.getenv("AUTO_SYNC_HOUR_LOCAL") or "4").strip())  # default 04:00 local
+except Exception:
+    AUTO_SYNC_HOUR_LOCAL = 4
 
 CRON_SECRET = (os.getenv("CRON_SECRET") or "").strip()
 # =======================================================
@@ -90,7 +101,6 @@ threading.Thread(target=run_http, daemon=True).start()
 def db():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
-    # устойчивость к параллельным операциям
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
@@ -109,7 +119,6 @@ def is_admin(uid: int) -> bool:
 
 def init_db():
     with db() as con:
-        # users
         con.execute("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
@@ -122,7 +131,6 @@ def init_db():
         )
         """)
 
-        # matches
         con.execute("""
         CREATE TABLE IF NOT EXISTS matches(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,7 +143,6 @@ def init_db():
         """)
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_external_id ON matches(external_id)")
 
-        # votes
         con.execute("""
         CREATE TABLE IF NOT EXISTS votes(
             match_id INTEGER NOT NULL,
@@ -148,7 +155,6 @@ def init_db():
         )
         """)
 
-        # results (for scoring)
         con.execute("""
         CREATE TABLE IF NOT EXISTS results(
             match_id INTEGER NOT NULL,
@@ -159,7 +165,6 @@ def init_db():
         )
         """)
 
-        # seasonal scores
         con.execute("""
         CREATE TABLE IF NOT EXISTS scores_season(
             season TEXT NOT NULL,
@@ -174,7 +179,6 @@ def init_db():
         )
         """)
 
-        # follows
         con.execute("""
         CREATE TABLE IF NOT EXISTS follows(
             follower_id INTEGER NOT NULL,
@@ -184,7 +188,6 @@ def init_db():
         )
         """)
 
-        # achievements
         con.execute("""
         CREATE TABLE IF NOT EXISTS user_achievements(
             user_id INTEGER NOT NULL,
@@ -195,7 +198,6 @@ def init_db():
         )
         """)
 
-        # state (only for find player)
         con.execute("""
         CREATE TABLE IF NOT EXISTS user_state(
             user_id INTEGER PRIMARY KEY,
@@ -204,7 +206,6 @@ def init_db():
         )
         """)
 
-        # daily tasks / quests
         con.execute("""
         CREATE TABLE IF NOT EXISTS daily_tasks(
             user_id INTEGER NOT NULL,
@@ -217,7 +218,6 @@ def init_db():
         )
         """)
 
-        # pending fixtures (admin approval)
         con.execute("""
         CREATE TABLE IF NOT EXISTS pending_fixtures(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,7 +230,6 @@ def init_db():
         )
         """)
 
-        # duels
         con.execute("""
         CREATE TABLE IF NOT EXISTS duels(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -523,7 +522,6 @@ async def notify_rank_change(bot: Bot, season: str, user_id: int):
         set_last_rank(user_id, new_rank)
         await safe_dm(bot, user_id, f"📈 Ты поднялся в рейтинге! Теперь #{new_rank} (было #{old_rank}).")
     elif new_rank > old_rank:
-        # не спамим падение — можно включить при желании
         set_last_rank(user_id, new_rank)
 
 
@@ -531,7 +529,7 @@ async def notify_rank_change(bot: Bot, season: str, user_id: int):
 TASK_DEFS = {
     "pred_3": {"name": "Сделай 3 прогноза сегодня", "goal": 3, "reward_points": 2},
     "correct_1": {"name": "Угадай 1 прогноз сегодня", "goal": 1, "reward_points": 3},
-    "duel_1": {"name": "Сыграй 1 дуэль сегодня", "goal": 1, "reward_points": 3},  # прогрессится при завершении дуэли
+    "duel_1": {"name": "Сыграй 1 дуэль сегодня", "goal": 1, "reward_points": 3},
 }
 
 def ensure_daily_tasks(user_id: int):
@@ -794,7 +792,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
             ensure_score_row(season, uid, uname)
             ensure_daily_tasks(uid)
 
-            # total++
             con.execute("""
                 UPDATE scores_season
                 SET total=total+1, username=COALESCE(?, username)
@@ -803,7 +800,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
 
             if choice == result:
                 winners_count += 1
-                # daily correct_1
                 con.execute("""
                     UPDATE daily_tasks
                     SET progress = CASE
@@ -813,7 +809,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
                     WHERE user_id=? AND day=? AND task_key='correct_1'
                 """, (uid, today_key_utc()))
 
-                # points, correct, streak
                 con.execute("""
                     UPDATE scores_season
                     SET points=points+?,
@@ -823,7 +818,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
                     WHERE season=? AND user_id=?
                 """, (points_per_win, season, uid))
             else:
-                # streak reset
                 con.execute("""
                     UPDATE scores_season
                     SET streak=0
@@ -835,10 +829,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
     return ("ok", winners_count, points_per_win)
 
 def settle_duels_for_result(bot: Bot, mid: int, bet_type: str, result: str):
-    """
-    Вызывается после выставления результата по типу.
-    Проверяет все accepted дуэли на этот матч/тип и завершает их.
-    """
     season = current_season()
     with db() as con:
         duels = con.execute("""
@@ -856,7 +846,6 @@ def settle_duels_for_result(bot: Bot, mid: int, bet_type: str, result: str):
             ch_choice = get_duel_choice(duel_id, ch_id)
             op_choice = get_duel_choice(duel_id, op_id)
 
-            # если кто-то не поставил прогноз — считаем автопоражение (или ничью)
             if not ch_choice and not op_choice:
                 winner = None
                 notes = "Оба не сделали прогноз — ничья."
@@ -879,25 +868,19 @@ def settle_duels_for_result(bot: Bot, mid: int, bet_type: str, result: str):
                     winner = None
                     notes = "Оба угадали или оба не угадали — ничья."
 
-            # usernames for stats
-            with db() as con:
-                ru = con.execute("SELECT username FROM users WHERE user_id=?", (ch_id,)).fetchone()
-                ou = con.execute("SELECT username FROM users WHERE user_id=?", (op_id,)).fetchone()
+            with db() as con2:
+                ru = con2.execute("SELECT username FROM users WHERE user_id=?", (ch_id,)).fetchone()
+                ou = con2.execute("SELECT username FROM users WHERE user_id=?", (op_id,)).fetchone()
             ch_un = (ru["username"] if ru else None)
             op_un = (ou["username"] if ou else None)
 
             complete_duel(season, duel_id, winner, notes, ch_id, op_id, ch_un, op_un)
 
-            # daily duel_1 progress for both participants
             inc_task_progress(ch_id, "duel_1", 1)
             inc_task_progress(op_id, "duel_1", 1)
 
-            # notify both
-            try:
-                await safe_dm(bot, ch_id, f"⚔️ Дуэль завершена!\n{notes}")
-                await safe_dm(bot, op_id, f"⚔️ Дуэль завершена!\n{notes}")
-            except Exception:
-                pass
+            await safe_dm(bot, ch_id, f"⚔️ Дуэль завершена!\n{notes}")
+            await safe_dm(bot, op_id, f"⚔️ Дуэль завершена!\n{notes}")
 
     asyncio.create_task(_run())
 
@@ -950,9 +933,6 @@ def pending_kb(pid: int):
     return kb.as_markup()
 
 async def sync_today_internal(bot: Bot, requested_by: str = "auto"):
-    """
-    Внутренний sync: формирует pending и отправляет админу карточки.
-    """
     if ADMIN_ID == 0:
         return
 
@@ -969,7 +949,7 @@ async def sync_today_internal(bot: Bot, requested_by: str = "auto"):
     sent = 0
     skipped = 0
 
-    await safe_dm(bot, ADMIN_ID, f"🕗 Автосинк матчей на {day} ({requested_by})\nК подтверждению отправляю карточки…")
+    await safe_dm(bot, ADMIN_ID, f"🕓 Лондон 04:00 → синк матчей на {day} ({requested_by})\nК подтверждению отправляю карточки…")
 
     for m in fixtures:
         comp_code = ((m.get("competition") or {}).get("code") or "").strip()
@@ -1001,9 +981,9 @@ async def sync_today_internal(bot: Bot, requested_by: str = "auto"):
             reply_markup=pending_kb(pid)
         )
         sent += 1
-        await asyncio.sleep(0.25)  # анти-лимит
+        await asyncio.sleep(0.25)
 
-    await safe_dm(bot, ADMIN_ID, f"✅ Автосинк готов.\nК рассмотрению: {sent}\nПропущено дублей: {skipped}")
+    await safe_dm(bot, ADMIN_ID, f"✅ Синк готов.\nК рассмотрению: {sent}\nПропущено дублей: {skipped}")
 
 
 # ===================== UI / Menu =====================
@@ -1114,7 +1094,7 @@ def profile_kb(viewer_id: int, target_id: int):
     return kb.as_markup()
 
 
-# ===================== Choice labels =====================
+# ===================== Choice labels / stats text =====================
 def choice_label(bt: str, choice: str) -> str:
     if bt == "1x2":
         return {"home": "🏠 Хозяева", "draw": "🤝 Ничья", "away": "🚌 Гости"}.get(choice, choice)
@@ -1205,11 +1185,26 @@ def profile_text(season: str, urow, srow) -> str:
 # ===================== Commands / Handlers =====================
 @dp.message(CommandStart())
 async def start(message: Message):
+    """
+    + Поддержка deep-link:
+      /start profile_123 -> показать публичный профиль
+    """
     upsert_user(message)
     ensure_score_row(current_season(), message.from_user.id, message.from_user.username)
     ensure_daily_tasks(message.from_user.id)
     set_state(message.from_user.id, None)
+
+    arg = (message.text or "").split(maxsplit=1)
+    payload = arg[1].strip() if len(arg) > 1 else ""
+
     await message.answer("🤖 Predictor Bot\n\nМеню снизу 👇", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
+
+    if payload.startswith("profile_"):
+        try:
+            target_id = int(payload.split("_", 1)[1])
+            await send_profile(message, target_id)
+        except Exception:
+            pass
 
 @dp.message(Command("whoami"))
 async def whoami(message: Message):
@@ -1220,7 +1215,9 @@ async def whoami(message: Message):
         f"ADMIN_ID(env): {ADMIN_ID}\n"
         f"Ты админ: {'ДА' if is_admin(message.from_user.id) else 'НЕТ'}\n\n"
         f"AUTO_SYNC_ENABLED: {AUTO_SYNC_ENABLED}\n"
-        f"AUTO_SYNC_HOUR_UTC: {AUTO_SYNC_HOUR_UTC}\n"
+        f"AUTO_SYNC_TZ: {AUTO_SYNC_TZ or '(не задан)'}\n"
+        f"AUTO_SYNC_HOUR_LOCAL: {AUTO_SYNC_HOUR_LOCAL}\n"
+        f"AUTO_SYNC_HOUR_UTC (fallback): {AUTO_SYNC_HOUR_UTC}\n\n"
         f"FOOTBALL_DATA_TOKEN: {'есть' if bool(FOOTBALL_DATA_TOKEN) else 'нет'}\n"
         f"FD_COMPETITIONS: {FD_COMPETITIONS or '(пусто)'}"
     )
@@ -1335,10 +1332,8 @@ async def vote_cb(call: CallbackQuery):
         """, (mid, call.from_user.id, call.from_user.username, bt, choice, now_iso()))
         con.commit()
 
-    # tasks
     inc_task_progress(call.from_user.id, "pred_3", 1)
 
-    # link to duel predictions (if duel active)
     duel_ids = find_active_duels_for_vote(call.from_user.id, mid, bt)
     for duel_id in duel_ids:
         save_duel_prediction(duel_id, call.from_user.id, choice)
@@ -1468,7 +1463,6 @@ async def share_profile(call: CallbackQuery):
     await call.answer("Ссылка готова ✅", show_alert=True)
     await call.message.reply(f"🔗 Ссылка на профиль:\n{link}")
 
-# Find player flow
 @dp.message(F.text == BTN_FIND)
 async def find_player_start(message: Message):
     upsert_user(message)
@@ -1492,7 +1486,6 @@ async def find_player_cmd(message: Message):
     set_state(message.from_user.id, None)
     await send_profile(message, uid)
 
-# ВАЖНО: этот хэндлер срабатывает ТОЛЬКО когда ждём username
 @dp.message(lambda m: get_state(m.from_user.id) == "await_find_username")
 async def find_player_input(message: Message):
     upsert_user(message)
@@ -1523,7 +1516,6 @@ async def help_menu(message: Message):
         reply_markup=main_menu_kb(is_admin(message.from_user.id))
     )
 
-# ===================== Tasks claim =====================
 @dp.callback_query(F.data.startswith("task:claim:"))
 async def task_claim(call: CallbackQuery):
     upsert_user(call)
@@ -1535,7 +1527,6 @@ async def task_claim(call: CallbackQuery):
     await notify_rank_change(call.bot, season, call.from_user.id)
     await send_profile(call.message, call.from_user.id)
 
-# ===================== Admin: create match =====================
 @dp.message(F.text == BTN_NEW)
 async def newmatch_hint(message: Message):
     upsert_user(message)
@@ -1631,7 +1622,6 @@ async def pending_fixture_actions(call: CallbackQuery):
         await call.answer()
         return
 
-# ===================== Admin: close / set result =====================
 @dp.callback_query(F.data.startswith("admin:"))
 async def admin_actions(call: CallbackQuery):
     upsert_user(call)
@@ -1708,7 +1698,6 @@ async def set_result_cb(call: CallbackQuery):
 
     season = current_season()
 
-    # уведомления всем проголосовавшим + rank/achievements
     with db() as con:
         voters = con.execute("""
             SELECT user_id, COALESCE(username,'') as username, choice
@@ -1724,7 +1713,6 @@ async def set_result_cb(call: CallbackQuery):
         ch = v["choice"]
         correct = (ch == result)
 
-        # crowd stats
         crowd_line = ""
         if total_this_type > 0:
             ordered = sorted(dist.items(), key=lambda x: (-x[1], x[0]))[:3]
@@ -1734,9 +1722,8 @@ async def set_result_cb(call: CallbackQuery):
                 parts.append(f"{choice_label(bt, opt)} {pct:.0f}%")
             crowd_line = "👥 Толпа: " + " • ".join(parts)
 
-        # fetch updated stats
-        with db() as con:
-            srow = con.execute("""
+        with db() as con2:
+            srow = con2.execute("""
                 SELECT points, streak FROM scores_season
                 WHERE season=? AND user_id=?
             """, (season, uid)).fetchone()
@@ -1760,7 +1747,6 @@ async def set_result_cb(call: CallbackQuery):
         await check_and_notify_achievements(call.bot, season, uid)
         await notify_rank_change(call.bot, season, uid)
 
-    # завершить дуэли по этому типу
     settle_duels_for_result(call.bot, mid, bt, result)
 
     await call.answer("Готово ✅", show_alert=True)
@@ -1772,7 +1758,8 @@ async def set_result_cb(call: CallbackQuery):
         reply_markup=match_menu_kb(mid, True)
     )
 
-# ===================== Duels UI =====================
+
+# ===================== Duels UI (unchanged) =====================
 def duel_pick_match_kb(target_id: int, matches):
     kb = InlineKeyboardBuilder()
     for r in matches:
@@ -1923,7 +1910,23 @@ async def duel_decline(call: CallbackQuery):
     await call.message.edit_text("Ок, отклонил дуэль ❌")
 
 
-# ===================== Auto sync loop =====================
+# ===================== Auto sync loop (London-aware) =====================
+def next_run_utc_from_local(tz_name: str, hour_local: int) -> datetime:
+    """
+    Calculates the next run time in UTC, based on local time zone and local hour.
+    Supports DST correctly (e.g., Europe/London).
+    """
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz)
+
+    # next local time at HH:00
+    target_local = now_local.replace(hour=hour_local, minute=0, second=0, microsecond=0)
+    if target_local <= now_local:
+        target_local += timedelta(days=1)
+
+    # convert to UTC
+    return target_local.astimezone(timezone.utc)
+
 def next_run_utc(hour_utc: int) -> datetime:
     now = datetime.now(timezone.utc)
     target = now.replace(hour=hour_utc, minute=0, second=0, microsecond=0)
@@ -1934,12 +1937,11 @@ def next_run_utc(hour_utc: int) -> datetime:
 async def auto_sync_loop(bot: Bot):
     global CRON_REQUESTED
 
-    # небольшая задержка, чтобы polling успел подняться
     await asyncio.sleep(2)
 
     while True:
         try:
-            # cron trigger has priority
+            # Cron trigger has priority
             if CRON_REQUESTED:
                 CRON_REQUESTED = False
                 await sync_today_internal(bot, requested_by="cron")
@@ -1950,9 +1952,15 @@ async def auto_sync_loop(bot: Bot):
                 await asyncio.sleep(30)
                 continue
 
-            run_at = next_run_utc(AUTO_SYNC_HOUR_UTC)
+            # schedule: prefer local tz if provided
+            if AUTO_SYNC_TZ:
+                run_at = next_run_utc_from_local(AUTO_SYNC_TZ, AUTO_SYNC_HOUR_LOCAL)
+            else:
+                run_at = next_run_utc(AUTO_SYNC_HOUR_UTC)
+
             sleep_s = (run_at - datetime.now(timezone.utc)).total_seconds()
-            # чтобы не уснуть навсегда, спим кусками
+
+            # sleep in chunks so cron triggers still work
             while sleep_s > 0:
                 if CRON_REQUESTED:
                     break
@@ -1985,7 +1993,6 @@ async def main():
     me = await bot.get_me()
     BOT_USERNAME = me.username
 
-    # start auto loop
     asyncio.create_task(auto_sync_loop(bot))
 
     await dp.start_polling(bot)
