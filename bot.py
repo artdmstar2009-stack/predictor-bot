@@ -3,9 +3,12 @@ import logging
 import os
 import sqlite3
 import threading
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from typing import Optional, Tuple, List
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -15,7 +18,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 # ===== CONFIG =====
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_PATH = "predictor.db"
+DB_PATH = os.getenv("DB_PATH", "predictor.db")
 # ==================
 
 dp = Dispatcher()
@@ -46,8 +49,13 @@ def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
 def current_season() -> str:
-    # season = month: YYYY-MM (UTC)
     return datetime.utcnow().strftime("%Y-%m")
+
+def today_key() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
 
 def init_db():
     with db() as con:
@@ -71,13 +79,22 @@ def init_db():
         """)
 
         # --- migrations: match of the day ---
-        # add columns if they don't exist (SQLite)
         try:
             con.execute("ALTER TABLE matches ADD COLUMN is_featured INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
         try:
             con.execute("ALTER TABLE matches ADD COLUMN bonus_multiplier REAL NOT NULL DEFAULT 1.0")
+        except Exception:
+            pass
+
+        # --- migrations: external fixtures to prevent duplicates ---
+        try:
+            con.execute("ALTER TABLE matches ADD COLUMN external_id TEXT")
+        except Exception:
+            pass
+        try:
+            con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_external_id ON matches(external_id)")
         except Exception:
             pass
 
@@ -101,7 +118,6 @@ def init_db():
             PRIMARY KEY(match_id, bet_type)
         )
         """)
-        # season scores
         con.execute("""
         CREATE TABLE IF NOT EXISTS scores_season(
             season TEXT NOT NULL,
@@ -115,7 +131,6 @@ def init_db():
             PRIMARY KEY(season, user_id)
         )
         """)
-        # follows
         con.execute("""
         CREATE TABLE IF NOT EXISTS follows(
             follower_id INTEGER NOT NULL,
@@ -124,7 +139,6 @@ def init_db():
             PRIMARY KEY(follower_id, followee_id)
         )
         """)
-        # achievements
         con.execute("""
         CREATE TABLE IF NOT EXISTS user_achievements(
             user_id INTEGER NOT NULL,
@@ -134,7 +148,6 @@ def init_db():
             PRIMARY KEY(user_id, season, key)
         )
         """)
-        # user state (for find player flow)
         con.execute("""
         CREATE TABLE IF NOT EXISTS user_state(
             user_id INTEGER PRIMARY KEY,
@@ -143,16 +156,29 @@ def init_db():
         )
         """)
 
-        # --- quests/tasks (daily) ---
+        # --- daily tasks ---
         con.execute("""
         CREATE TABLE IF NOT EXISTS daily_tasks(
             user_id INTEGER NOT NULL,
             day TEXT NOT NULL,
-            task_key TEXT NOT NULL,              -- e.g. pred_3, correct_1
+            task_key TEXT NOT NULL,
             goal INTEGER NOT NULL,
             progress INTEGER NOT NULL DEFAULT 0,
             claimed INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(user_id, day, task_key)
+        )
+        """)
+
+        # --- pending fixtures (admin approval list) ---
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS pending_fixtures(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ext_id TEXT NOT NULL UNIQUE,
+            day TEXT NOT NULL,
+            title TEXT NOT NULL,
+            kickoff_utc TEXT,
+            competition TEXT,
+            created_at TEXT NOT NULL
         )
         """)
 
@@ -165,11 +191,11 @@ def init_db():
             challenger_id INTEGER NOT NULL,
             opponent_id INTEGER NOT NULL,
             match_id INTEGER NOT NULL,
-            bet_type TEXT NOT NULL,               -- 1x2|score|total|btts
-            status TEXT NOT NULL DEFAULT 'pending',-- pending|accepted|declined|cancelled|completed
+            bet_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
             accepted_at TEXT,
             completed_at TEXT,
-            winner_id INTEGER,                    -- NULL = draw
+            winner_id INTEGER,
             notes TEXT
         )
         """)
@@ -198,9 +224,6 @@ def init_db():
 
 
 # ===================== Core helpers =====================
-def is_admin(uid: int) -> bool:
-    return uid == ADMIN_ID
-
 def upsert_user(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]):
     with db() as con:
         row = con.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -241,7 +264,9 @@ def ensure_score_row(season: str, user_id: int, username: Optional[str]):
 def get_open_matches():
     with db() as con:
         return con.execute("""
-            SELECT id, title, status, COALESCE(is_featured,0) as is_featured, COALESCE(bonus_multiplier,1.0) as bonus_multiplier
+            SELECT id, title, status,
+                   COALESCE(is_featured,0) as is_featured,
+                   COALESCE(bonus_multiplier,1.0) as bonus_multiplier
             FROM matches
             WHERE status='open'
             ORDER BY id DESC
@@ -250,7 +275,10 @@ def get_open_matches():
 def get_match(mid: int):
     with db() as con:
         return con.execute("""
-            SELECT id, title, status, COALESCE(is_featured,0) as is_featured, COALESCE(bonus_multiplier,1.0) as bonus_multiplier
+            SELECT id, title, status,
+                   COALESCE(is_featured,0) as is_featured,
+                   COALESCE(bonus_multiplier,1.0) as bonus_multiplier,
+                   external_id
             FROM matches WHERE id=?
         """, (mid,)).fetchone()
 
@@ -260,10 +288,6 @@ def close_match(mid: int):
         con.commit()
 
 def match_stats(mid: int) -> Tuple[dict, dict]:
-    """
-    totals_map[bet_type] = total_count
-    data[bet_type][choice] = count
-    """
     with db() as con:
         rows = con.execute("""
             SELECT bet_type, choice, COUNT(*) as c
@@ -386,17 +410,13 @@ def find_user_by_username(username: str) -> Optional[int]:
         return int(r["user_id"]) if r else None
 
 
-# ===================== Tasks (daily quests) =====================
-def today_key() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d")
-
+# ===================== Daily tasks =====================
 TASK_DEFS = {
     "pred_3": {"name": "Сделай 3 прогноза сегодня", "goal": 3, "reward_points": 2},
     "correct_1": {"name": "Угадай 1 прогноз сегодня", "goal": 1, "reward_points": 3},
 }
 
 def ensure_daily_tasks(season: str, user_id: int, username: Optional[str]):
-    """Create tasks for today if missing."""
     day = today_key()
     with db() as con:
         for key, meta in TASK_DEFS.items():
@@ -460,7 +480,6 @@ def claim_task_reward(season: str, user_id: int, task_key: str, username: Option
             UPDATE daily_tasks SET claimed=1
             WHERE user_id=? AND day=? AND task_key=?
         """, (user_id, day, task_key))
-        # bonus points go to season points, without changing total/correct/streak
         ensure_score_row(season, user_id, username)
         con.execute("""
             UPDATE scores_season SET points=points+?, username=COALESCE(?, username)
@@ -498,7 +517,65 @@ def tasks_kb(user_id: int):
     return kb.as_markup() if kb.buttons else None
 
 
+# ===================== Pending fixtures (вариант 3) =====================
+def fetch_today_fixtures_from_fd(day_yyyy_mm_dd: str) -> list:
+    token = os.getenv("FOOTBALL_DATA_TOKEN")
+    if not token:
+        return []
+    params = {"date": day_yyyy_mm_dd}
+    url = "https://api.football-data.org/v4/matches?" + urlencode(params)
+    req = Request(url, headers={"X-Auth-Token": token, "Accept": "application/json"})
+    with urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return data.get("matches", [])
+
+def save_pending_fixture(ext_id: str, day: str, title: str, kickoff_utc: str, competition: str) -> Optional[int]:
+    with db() as con:
+        try:
+            con.execute("""
+                INSERT INTO pending_fixtures(ext_id, day, title, kickoff_utc, competition, created_at)
+                VALUES(?,?,?,?,?,?)
+            """, (ext_id, day, title, kickoff_utc, competition, now_iso()))
+            con.commit()
+            pid = con.execute("SELECT id FROM pending_fixtures WHERE ext_id=?", (ext_id,)).fetchone()
+            return int(pid["id"]) if pid else None
+        except sqlite3.IntegrityError:
+            return None
+
+def pending_get(pid: int):
+    with db() as con:
+        return con.execute("SELECT * FROM pending_fixtures WHERE id=?", (pid,)).fetchone()
+
+def pending_delete(pid: int):
+    with db() as con:
+        con.execute("DELETE FROM pending_fixtures WHERE id=?", (pid,))
+        con.commit()
+
+def match_exists_by_ext(ext_id: str) -> bool:
+    with db() as con:
+        r = con.execute("SELECT 1 FROM matches WHERE external_id=?", (ext_id,)).fetchone()
+        return r is not None
+
+def insert_match_from_pending(p, featured: int, mult: float):
+    with db() as con:
+        con.execute("""
+            INSERT INTO matches(title,status,is_featured,bonus_multiplier,external_id)
+            VALUES(?, 'open', ?, ?, ?)
+        """, (p["title"], featured, mult, p["ext_id"]))
+        con.commit()
+
+def pending_kb(pending_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Добавить", callback_data=f"pf:add:{pending_id}")
+    kb.button(text="⭐ Матч дня x2", callback_data=f"pf:feat:{pending_id}:2")
+    kb.button(text="❌ Пропустить", callback_data=f"pf:skip:{pending_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 # ===================== Duels =====================
+BET_LABEL = {"1x2": "1X2", "score": "Точный счёт", "total": "Тотал", "btts": "Обе забьют"}
+
 def create_duel(season: str, challenger_id: int, opponent_id: int, match_id: int, bet_type: str) -> int:
     with db() as con:
         cur = con.execute("""
@@ -510,9 +587,7 @@ def create_duel(season: str, challenger_id: int, opponent_id: int, match_id: int
 
 def get_duel(duel_id: int):
     with db() as con:
-        return con.execute("""
-            SELECT * FROM duels WHERE id=?
-        """, (duel_id,)).fetchone()
+        return con.execute("SELECT * FROM duels WHERE id=?", (duel_id,)).fetchone()
 
 def set_duel_status(duel_id: int, status: str):
     with db() as con:
@@ -522,9 +597,7 @@ def set_duel_status(duel_id: int, status: str):
                 WHERE id=? AND status='pending'
             """, (now_iso(), duel_id))
         else:
-            con.execute("""
-                UPDATE duels SET status=? WHERE id=?
-            """, (status, duel_id))
+            con.execute("UPDATE duels SET status=? WHERE id=?", (status, duel_id))
         con.commit()
 
 def save_duel_prediction(duel_id: int, user_id: int, choice: str):
@@ -539,7 +612,6 @@ def save_duel_prediction(duel_id: int, user_id: int, choice: str):
         con.commit()
 
 def find_active_duels_for_vote(user_id: int, match_id: int, bet_type: str) -> List[int]:
-    """Return duel_ids where user participates and duel is accepted for this match & bet_type."""
     season = current_season()
     with db() as con:
         rows = con.execute("""
@@ -559,7 +631,6 @@ def complete_duel_and_stats(season: str, duel_id: int, winner_id: Optional[int],
             WHERE id=?
         """, (now_iso(), winner_id, notes, duel_id))
 
-        # ensure duel_stats rows
         con.execute("""
             INSERT OR IGNORE INTO duel_stats(season, user_id, username, wins, losses, draws)
             VALUES(?,?,?,?,0,0)
@@ -568,12 +639,11 @@ def complete_duel_and_stats(season: str, duel_id: int, winner_id: Optional[int],
             INSERT OR IGNORE INTO duel_stats(season, user_id, username, wins, losses, draws)
             VALUES(?,?,?,?,0,0)
         """, (season, opponent_id, opponent_username))
-        con.execute("""
-            UPDATE duel_stats SET username=COALESCE(?, username) WHERE season=? AND user_id=?
-        """, (challenger_username, season, challenger_id))
-        con.execute("""
-            UPDATE duel_stats SET username=COALESCE(?, username) WHERE season=? AND user_id=?
-        """, (opponent_username, season, opponent_id))
+
+        con.execute("UPDATE duel_stats SET username=COALESCE(?, username) WHERE season=? AND user_id=?",
+                    (challenger_username, season, challenger_id))
+        con.execute("UPDATE duel_stats SET username=COALESCE(?, username) WHERE season=? AND user_id=?",
+                    (opponent_username, season, opponent_id))
 
         if winner_id is None:
             con.execute("UPDATE duel_stats SET draws=draws+1 WHERE season=? AND user_id IN (?,?)",
@@ -588,71 +658,11 @@ def complete_duel_and_stats(season: str, duel_id: int, winner_id: Optional[int],
 
 def get_duel_stats(season: str, user_id: int) -> Tuple[int, int, int]:
     with db() as con:
-        r = con.execute("""
-            SELECT wins, losses, draws FROM duel_stats WHERE season=? AND user_id=?
-        """, (season, user_id)).fetchone()
+        r = con.execute("SELECT wins, losses, draws FROM duel_stats WHERE season=? AND user_id=?",
+                        (season, user_id)).fetchone()
         if not r:
             return 0, 0, 0
         return int(r["wins"]), int(r["losses"]), int(r["draws"])
-
-async def resolve_duels_for_result(bot: Bot, season: str, match_id: int, bet_type: str, correct_result: str):
-    """
-    When admin sets result for match+bet_type, resolve all accepted duels for that pair.
-    Winner: correct vs incorrect (draw otherwise).
-    """
-    with db() as con:
-        duels = con.execute("""
-            SELECT id, challenger_id, opponent_id
-            FROM duels
-            WHERE season=? AND match_id=? AND bet_type=? AND status='accepted'
-        """, (season, match_id, bet_type)).fetchall()
-
-        if not duels:
-            return
-
-        for d in duels:
-            duel_id = int(d["id"])
-            c_id = int(d["challenger_id"])
-            o_id = int(d["opponent_id"])
-
-            preds = con.execute("""
-                SELECT user_id, choice FROM duel_predictions WHERE duel_id=?
-            """, (duel_id,)).fetchall()
-            pmap = {int(x["user_id"]): x["choice"] for x in preds}
-            c_choice = pmap.get(c_id)
-            o_choice = pmap.get(o_id)
-
-            c_ok = (c_choice == correct_result)
-            o_ok = (o_choice == correct_result)
-
-            winner_id = None
-            if c_ok and not o_ok:
-                winner_id = c_id
-            elif o_ok and not c_ok:
-                winner_id = o_id
-            else:
-                winner_id = None
-
-            # usernames for nicer notifications
-            u1 = con.execute("SELECT username FROM users WHERE user_id=?", (c_id,)).fetchone()
-            u2 = con.execute("SELECT username FROM users WHERE user_id=?", (o_id,)).fetchone()
-            c_un = u1["username"] if u1 else None
-            o_un = u2["username"] if u2 else None
-
-            notes = f"bt={bet_type}; c={c_choice}; o={o_choice}; res={correct_result}"
-            complete_duel_and_stats(season, duel_id, winner_id, notes, c_id, o_id, c_un, o_un)
-
-            # notify both (DM)
-            async def duel_msg(uid: int) -> str:
-                my = pmap.get(uid)
-                if winner_id is None:
-                    return f"⚔️ Дуэль завершена: ничья.\nМатч #{match_id}\nТип: {BET_LABEL.get(bet_type, bet_type)}\nТвой прогноз: {choice_label(bet_type, my) if my else '—'}\nПравильно: {choice_label(bet_type, correct_result)}"
-                if winner_id == uid:
-                    return f"⚔️ Дуэль завершена: ты победил ✅\nМатч #{match_id}\nТип: {BET_LABEL.get(bet_type, bet_type)}\nТвой прогноз: {choice_label(bet_type, my) if my else '—'}\nПравильно: {choice_label(bet_type, correct_result)}"
-                return f"⚔️ Дуэль завершена: ты проиграл ❌\nМатч #{match_id}\nТип: {BET_LABEL.get(bet_type, bet_type)}\nТвой прогноз: {choice_label(bet_type, my) if my else '—'}\nПравильно: {choice_label(bet_type, correct_result)}"
-
-            await safe_dm(bot, c_id, await duel_msg(c_id))
-            await safe_dm(bot, o_id, await duel_msg(o_id))
 
 
 # ===================== Labels & UI =====================
@@ -664,8 +674,6 @@ BTN_FIND = "🔎 Найти игрока"
 BTN_HELP = "ℹ️ Помощь"
 BTN_NEW = "➕ Создать матч"
 BTN_BACK = "⬅️ Назад"
-
-BET_LABEL = {"1x2": "1X2", "score": "Точный счёт", "total": "Тотал", "btts": "Обе забьют"}
 
 def choice_label(bt: str, choice: str) -> str:
     if choice is None:
@@ -696,7 +704,6 @@ def main_menu_kb(user_is_admin: bool):
 def matches_list_kb(matches, user_is_admin: bool):
     kb = ReplyKeyboardBuilder()
     for r in matches:
-        # keep prefix "🏟 #" so parse works
         star = "⭐ " if int(r["is_featured"]) == 1 else ""
         mult = float(r["bonus_multiplier"]) if r["bonus_multiplier"] is not None else 1.0
         bonus = f"(x{mult:g}) " if int(r["is_featured"]) == 1 and mult != 1.0 else ""
@@ -773,7 +780,8 @@ def duel_pick_match_kb(target_id: int, matches):
         star = "⭐ " if int(r["is_featured"]) == 1 else ""
         mult = float(r["bonus_multiplier"]) if r["bonus_multiplier"] is not None else 1.0
         bonus = f"(x{mult:g}) " if int(r["is_featured"]) == 1 and mult != 1.0 else ""
-        kb.button(text=f"🏟 #{r['id']} {star}{bonus}{r['title']}", callback_data=f"duel:pickmatch:{target_id}:{r['id']}")
+        kb.button(text=f"🏟 #{r['id']} {star}{bonus}{r['title']}",
+                  callback_data=f"duel:pickmatch:{target_id}:{r['id']}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -835,14 +843,6 @@ def achievement_unlocked(user_id: int, season: str, key: str) -> bool:
         con.commit()
         return True
 
-def achievement_text(key: str) -> str:
-    return {
-        "first_pred": "🟢 Первое участие — ты сделал первый прогноз!",
-        "first_win": "🏅 Первая победа — ты впервые угадал!",
-        "streak3": "🔥 Серия 3 — ты угадал 3 раза подряд!",
-        "streak5": "💎 Серия 5 — ты угадал 5 раз подряд!",
-    }.get(key, f"🏆 Достижение: {key}")
-
 async def check_and_notify_achievements(bot: Bot, season: str, user_id: int):
     with db() as con:
         row = con.execute("""
@@ -859,13 +859,13 @@ async def check_and_notify_achievements(bot: Bot, season: str, user_id: int):
     streak = int(row["streak"])
 
     if total >= 1 and achievement_unlocked(user_id, season, "first_pred"):
-        await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("first_pred"))
+        await safe_dm(bot, user_id, "🏅 Достижение: первый прогноз!")
     if correct >= 1 and achievement_unlocked(user_id, season, "first_win"):
-        await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("first_win"))
+        await safe_dm(bot, user_id, "🏅 Достижение: первая победа!")
     if streak >= 3 and achievement_unlocked(user_id, season, "streak3"):
-        await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("streak3"))
+        await safe_dm(bot, user_id, "🏅 Достижение: серия 3!")
     if streak >= 5 and achievement_unlocked(user_id, season, "streak5"):
-        await safe_dm(bot, user_id, "🏅 Новое достижение!\n" + achievement_text("streak5"))
+        await safe_dm(bot, user_id, "🏅 Достижение: серия 5!")
 
 async def notify_rank_change(bot: Bot, season: str, user_id: int):
     new_rank = get_rank(season, user_id)
@@ -875,12 +875,12 @@ async def notify_rank_change(bot: Bot, season: str, user_id: int):
 
     if old_rank is None:
         set_last_rank(user_id, new_rank)
-        await safe_dm(bot, user_id, f"🏆 Ты появился в рейтинге сезона {season}!\nТекущее место: #{new_rank}")
+        await safe_dm(bot, user_id, f"🏆 Ты появился в рейтинге сезона {season}! Место: #{new_rank}")
         return
 
     if new_rank < old_rank:
         set_last_rank(user_id, new_rank)
-        await safe_dm(bot, user_id, f"📈 Ты поднялся в рейтинге сезона {season}!\nТеперь ты #{new_rank} (было #{old_rank}).")
+        await safe_dm(bot, user_id, f"📈 Ты поднялся в рейтинге! Теперь #{new_rank} (было #{old_rank}).")
     else:
         set_last_rank(user_id, new_rank)
 
@@ -900,19 +900,11 @@ def get_match_multiplier(mid: int) -> float:
     return mult if is_feat == 1 else 1.0
 
 def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int, int]:
-    """
-    Sets result once per match+bet_type and scores current season:
-    - total +1 for each participant
-    - if correct: points + (1 * multiplier), correct+1, streak+1, best_streak update
-    - if wrong: streak = 0
-    Returns: (status, winners_count, multiplier_applied_int_points_per_win)
-    """
     if not can_score(mid, bet_type):
         return ("already", 0, 1)
 
     season = current_season()
     mult = get_match_multiplier(mid)
-    # points per correct = round(1 * mult) but keep at least 1 if mult>=1
     points_per_win = int(round(1 * mult))
     if points_per_win < 1:
         points_per_win = 1
@@ -946,7 +938,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
             ensure_score_row(season, uid, uname)
             ensure_daily_tasks(season, uid, uname)
 
-            # total +1
             con.execute("""
                 UPDATE scores_season
                 SET total = total + 1,
@@ -956,9 +947,6 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
 
             if choice == result:
                 winners_count += 1
-                # task: correct_1
-                # (we increment in code below after commit using helper; but we can do it here safely)
-                # We'll increment via SQL directly:
                 con.execute("""
                     UPDATE daily_tasks
                     SET progress = CASE
@@ -1051,8 +1039,6 @@ def profile_text(season: str, urow, srow) -> str:
         acc = 0.0
 
     wins, losses, draws = get_duel_stats(season, int(urow["user_id"]))
-
-    # tasks
     ensure_daily_tasks(season, int(urow["user_id"]), urow["username"])
     ttxt = tasks_text(int(urow["user_id"]))
 
@@ -1211,10 +1197,10 @@ async def vote_cb(call: CallbackQuery):
         """, (mid, call.from_user.id, call.from_user.username, bt, choice, now_iso()))
         con.commit()
 
-    # task: pred_3
+    # tasks
     inc_task_progress(call.from_user.id, "pred_3", 1)
 
-    # if user is in accepted duel for this match/bet_type -> save duel prediction
+    # if accepted duel exists for this match/bt -> save duel prediction too
     duel_ids = find_active_duels_for_vote(call.from_user.id, mid, bt)
     for duel_id in duel_ids:
         save_duel_prediction(duel_id, call.from_user.id, choice)
@@ -1349,12 +1335,9 @@ async def send_profile(message_or_call, target_user_id: int):
     text = profile_text(season, urow, srow)
     kb = profile_kb(viewer_id, target_user_id)
 
-    # IMPORTANT: do NOT spam reply main menu here; it is already visible at bottom
     if isinstance(message_or_call, Message):
         await message_or_call.answer(text, disable_web_page_preview=True)
-        # actions inline
         await message_or_call.answer("Действия:", reply_markup=kb)
-        # show claim buttons if any
         t_kb = tasks_kb(target_user_id) if target_user_id == message_or_call.from_user.id else None
         if t_kb:
             await message_or_call.answer("🎁 Награды за задания:", reply_markup=t_kb)
@@ -1386,7 +1369,6 @@ async def follow_cb(call: CallbackQuery):
         unfollow_user(call.from_user.id, target_id)
         await call.answer("Отписался ✅", show_alert=True)
 
-    # refresh profile card in the same message
     season = current_season()
     urow, srow = get_profile(season, target_id)
     if not urow:
@@ -1407,7 +1389,6 @@ async def share_profile(call: CallbackQuery):
     await call.answer("Ссылка готова ✅", show_alert=True)
     await call.message.reply(f"🔗 Ссылка на профиль:\n{link}")
 
-# ===== Tasks claim =====
 @dp.callback_query(F.data.startswith("task:claim:"))
 async def task_claim(call: CallbackQuery):
     season = current_season()
@@ -1415,7 +1396,6 @@ async def task_claim(call: CallbackQuery):
     ensure_daily_tasks(season, call.from_user.id, call.from_user.username)
     ok, msg = claim_task_reward(season, call.from_user.id, key, call.from_user.username)
     await call.answer(msg, show_alert=True)
-    # refresh profile view quickly (send a fresh profile message)
     await call.message.reply("Обновил профиль 👇")
     await send_profile(call.message, call.from_user.id)
     await notify_rank_change(call.bot, season, call.from_user.id)
@@ -1429,15 +1409,110 @@ async def help_menu(message: Message):
         "ℹ️ Помощь\n\n"
         "• «⚽ Активные матчи» → выбирай матч → прогноз/статистика\n"
         "• «🏆 Лидерборд» — топ сезона\n"
-        "• «👤 Профиль» — твой профиль + задания + дуэли\n"
+        "• «👤 Профиль» — профиль + задания + дуэли\n"
         "• «🔎 Найти игрока» — поиск по @username\n\n"
-        "Можно также:\n"
-        "/find @username\n\n"
         "Админ:\n"
         "/newmatch <название>\n"
-        "/newfeatured <множитель> <название>  (матч дня ⭐)\n",
+        "/newfeatured <множитель> <название>\n"
+        "/sync_today  (подтянуть матчи на сегодня и подтвердить кнопками)\n",
         reply_markup=main_menu_kb(is_admin(message.from_user.id))
     )
+
+
+# ===================== ВАРИАНТ 3: /sync_today + кнопки подтверждения =====================
+@dp.message(Command("sync_today"))
+async def sync_today(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    day = today_key()
+    comps = set(x.strip() for x in (os.getenv("FD_COMPETITIONS", "").split(",")) if x.strip())
+
+    fixtures = fetch_today_fixtures_from_fd(day)
+    if not fixtures:
+        await message.answer("Не нашёл матчей (или нет FOOTBALL_DATA_TOKEN / лимит / API недоступно).")
+        return
+
+    sent = 0
+    skipped = 0
+
+    for m in fixtures:
+        comp = (m.get("competition") or {})
+        comp_code = (comp.get("code") or "").strip()
+
+        # фильтр по лигам
+        if comps and comp_code not in comps:
+            continue
+
+        ext_id = str(m.get("id"))
+        if not ext_id:
+            continue
+
+        # если уже в matches (дубликат) - пропускаем
+        if match_exists_by_ext(ext_id):
+            skipped += 1
+            continue
+
+        home = ((m.get("homeTeam") or {}).get("name") or "").strip()
+        away = ((m.get("awayTeam") or {}).get("name") or "").strip()
+        utc_date = (m.get("utcDate") or "").strip()
+        title = f"{home} vs {away}".strip()
+
+        if not home or not away:
+            continue
+
+        pid = save_pending_fixture(ext_id, day, title, utc_date, comp_code)
+        if not pid:
+            continue
+
+        text = f"📅 {day}\n🏟 {title}\nЛига: {comp_code or '—'}\nKickoff(UTC): {utc_date or '—'}"
+        await message.answer(text, reply_markup=pending_kb(pid))
+        sent += 1
+
+    await message.answer(f"Готово ✅\nК рассмотрению: {sent}\nПропущено дублей: {skipped}")
+
+@dp.callback_query(F.data.startswith("pf:"))
+async def pending_fixture_actions(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Только админ", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    action = parts[1]
+    pid = int(parts[2])
+
+    p = pending_get(pid)
+    if not p:
+        await call.answer("Уже обработано.", show_alert=True)
+        return
+
+    if action == "skip":
+        pending_delete(pid)
+        await call.message.edit_text(call.message.text + "\n\n❌ Пропущено")
+        await call.answer()
+        return
+
+    if match_exists_by_ext(p["ext_id"]):
+        pending_delete(pid)
+        await call.message.edit_text(call.message.text + "\n\n⚠️ Уже добавлено ранее (дубликат).")
+        await call.answer()
+        return
+
+    if action == "add":
+        insert_match_from_pending(p, featured=0, mult=1.0)
+        pending_delete(pid)
+        await call.message.edit_text(call.message.text + "\n\n✅ Добавлено в активные матчи")
+        await call.answer()
+        return
+
+    if action == "feat":
+        mult = float(parts[3]) if len(parts) > 3 else 2.0
+        insert_match_from_pending(p, featured=1, mult=mult)
+        pending_delete(pid)
+        await call.message.edit_text(call.message.text + f"\n\n⭐ Добавлено как Матч дня (x{mult:g})")
+        await call.answer()
+        return
+
 
 # ===================== DUELS HANDLERS =====================
 @dp.callback_query(F.data.startswith("duel:start:"))
@@ -1487,19 +1562,12 @@ async def duel_picktype(call: CallbackQuery):
     season = current_season()
     duel_id = create_duel(season, call.from_user.id, target_id, mid, bt)
 
-    # send invite to opponent
     try:
         title = m["title"]
+        from_txt = f"@{call.from_user.username}" if call.from_user.username else f"id:{call.from_user.id}"
         await call.bot.send_message(
             target_id,
-            f"⚔️ Тебя вызывают на дуэль!\n"
-            f"От: @{call.from_user.username}" if call.from_user.username else f"От: id:{call.from_user.id}",
-        )
-        await call.bot.send_message(
-            target_id,
-            f"Матч: #{mid} {title}\n"
-            f"Тип: {BET_LABEL.get(bt, bt)}\n\n"
-            f"Принять дуэль?",
+            f"⚔️ Тебя вызывают на дуэль!\nОт: {from_txt}\nМатч: #{mid} {title}\nТип: {BET_LABEL.get(bt, bt)}\n\nПринять дуэль?",
             reply_markup=duel_invite_kb(duel_id)
         )
     except Exception:
@@ -1509,11 +1577,8 @@ async def duel_picktype(call: CallbackQuery):
 
     await call.message.edit_text(
         "✅ Приглашение отправлено сопернику в ЛС.\n\n"
-        "Как дуэль работает:\n"
-        "— соперник принимает дуэль\n"
-        "— вы оба делаете прогноз на этот матч по выбранному типу\n"
-        "— после выставления результата бот сам подведёт итог ⚔️",
-        reply_markup=profile_kb(call.from_user.id, target_id)
+        "После принятия — каждый делает прогноз на этот матч по выбранному типу.\n"
+        "После выставления результата бот сам подведёт итог ⚔️"
     )
     await call.answer()
 
@@ -1534,7 +1599,6 @@ async def duel_accept(call: CallbackQuery):
     set_duel_status(duel_id, "accepted")
     await call.answer("Принято ✅", show_alert=True)
 
-    # notify challenger
     try:
         await call.bot.send_message(int(d["challenger_id"]), "✅ Твою дуэль приняли! Делай прогноз на матч 👍")
     except Exception:
@@ -1543,7 +1607,7 @@ async def duel_accept(call: CallbackQuery):
     await call.message.edit_text(
         "✅ Дуэль принята!\n\n"
         "Теперь сделай прогноз на этот матч по указанному типу.\n"
-        "Открой: «⚽ Активные матчи» → выбери матч → Сделать прогноз.",
+        "Открой: «⚽ Активные матчи» → выбери матч → Сделать прогноз."
     )
 
 @dp.callback_query(F.data.startswith("duel:decline:"))
@@ -1576,12 +1640,18 @@ async def duel_decline(call: CallbackQuery):
 async def newmatch_hint(message: Message):
     if not is_admin(message.from_user.id):
         return
-    await message.answer("Создай матч командой:\n/newmatch Real vs Barca (02.02 20:00)\n\nИли матч дня:\n/newfeatured 2 Real vs Barca")
+    await message.answer(
+        "Создай матч:\n"
+        "/newmatch Real vs Barca (20:00)\n\n"
+        "Матч дня:\n"
+        "/newfeatured 2 Real vs Barca\n\n"
+        "Авто-матчи на сегодня:\n"
+        "/sync_today"
+    )
 
 @dp.message(Command("newmatch"))
 async def newmatch_cmd(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-
     if not is_admin(message.from_user.id):
         return
     title = message.text.replace("/newmatch", "").strip()
@@ -1590,7 +1660,7 @@ async def newmatch_cmd(message: Message):
         return
 
     with db() as con:
-        con.execute("INSERT INTO matches(title,status,is_featured,bonus_multiplier) VALUES(?, 'open', 0, 1.0)", (title,))
+        con.execute("INSERT INTO matches(title,status,is_featured,bonus_multiplier,external_id) VALUES(?, 'open', 0, 1.0, NULL)", (title,))
         con.commit()
 
     await message.answer("Матч создан ✅\nНажми «⚽ Активные матчи», чтобы увидеть его в списке.")
@@ -1614,7 +1684,7 @@ async def newfeatured_cmd(message: Message):
 
     title = parts[2].strip()
     with db() as con:
-        con.execute("INSERT INTO matches(title,status,is_featured,bonus_multiplier) VALUES(?, 'open', 1, ?)", (title, mult))
+        con.execute("INSERT INTO matches(title,status,is_featured,bonus_multiplier,external_id) VALUES(?, 'open', 1, ?, NULL)", (title, mult))
         con.commit()
 
     await message.answer(f"⭐ Матч дня создан ✅ (x{mult:g})\nНажми «⚽ Активные матчи», чтобы увидеть его в списке.")
@@ -1753,9 +1823,6 @@ async def set_result_cb(call: CallbackQuery):
             await check_and_notify_achievements(bot, season, uid)
             await notify_rank_change(bot, season, uid)
 
-        # resolve duels for this match+type
-        await resolve_duels_for_result(bot, season, mid, bt, result)
-
     await call.answer("Готово ✅", show_alert=True)
     await call.message.edit_text(
         f"✅ Результат выставлен\nМатч #{mid}: {m['title']}\n"
@@ -1765,11 +1832,12 @@ async def set_result_cb(call: CallbackQuery):
         reply_markup=match_menu_kb(mid, True)
     )
 
+
 # ===================== MAIN =====================
 async def main():
     global BOT_USERNAME
-
     logging.basicConfig(level=logging.INFO)
+
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
     if ADMIN_ID == 0:
