@@ -25,6 +25,13 @@ async def to_thread_timeout(func, *args, timeout: int = 35, **kwargs):
 
 
 
+
+
+# ===================== Async helpers =====================
+async def adb(func, *args, timeout: int = 20, **kwargs):
+    """Run a blocking DB/CPU function in a worker thread (prevents event-loop freezes)."""
+    return await to_thread_timeout(func, *args, timeout=timeout, **kwargs)
+
 # ===================== ENV / CONFIG =====================
 TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 
@@ -110,6 +117,63 @@ def db():
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
+
+
+
+def db_fetchone(sql: str, params: tuple = ()):
+    with db() as con:
+        return con.execute(sql, params).fetchone()
+
+def db_fetchall(sql: str, params: tuple = ()):
+    with db() as con:
+        return con.execute(sql, params).fetchall()
+
+def db_execute(sql: str, params: tuple = ()):
+    with db() as con:
+        con.execute(sql, params)
+        con.commit()
+
+def db_save_vote(mid: int, uid: int, username: str, bt: str, choice: str):
+    db_execute(
+        """INSERT OR REPLACE INTO votes(match_id,user_id,username,bet_type,choice,created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (mid, uid, username, bt, choice, now_iso()),
+    )
+
+def db_fetch_my_votes(uid: int):
+    return db_fetchall(
+        """SELECT v.match_id, m.title, v.bet_type, v.choice, m.status, v.created_at,
+                  m.is_featured, m.bonus_multiplier
+           FROM votes v
+           JOIN matches m ON m.id=v.match_id
+           WHERE v.user_id=?
+           ORDER BY v.match_id DESC, v.created_at DESC""",
+        (uid,),
+    )
+
+def db_fetch_leaderboard(season: str, limit: int = 20):
+    return db_fetchall(
+        """SELECT COALESCE(username,'') as username, user_id, points, correct, total
+           FROM scores_season
+           WHERE season=?
+           ORDER BY points DESC, user_id ASC
+           LIMIT ?""",
+        (season, limit),
+    )
+
+def db_fetch_voters(mid: int, bt: str):
+    return db_fetchall(
+        """SELECT user_id, COALESCE(username,'') as username, choice
+           FROM votes
+           WHERE match_id=? AND bet_type=?""",
+        (mid, bt),
+    )
+
+def db_fetch_user_points_streak(season: str, uid: int):
+    return db_fetchone(
+        """SELECT points, streak FROM scores_season WHERE season=? AND user_id=?""",
+        (season, uid),
+    )
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
@@ -328,13 +392,7 @@ def ensure_score_row(season: str, user_id: int, username: Optional[str]):
         con.commit()
 
 def get_rank(season: str, user_id: int) -> Optional[int]:
-    with db() as con:
-        rows = con.execute("""
-            SELECT user_id
-            FROM scores_season
-            WHERE season=?
-            ORDER BY points DESC, user_id ASC
-        """, (season,)).fetchall()
+    rows = await adb(db_fetch_my_votes, message.from_user.id)
     for i, r in enumerate(rows, start=1):
         if int(r["user_id"]) == int(user_id):
             return i
@@ -371,7 +429,7 @@ def close_match(mid: int):
         con.execute("UPDATE matches SET status='closed' WHERE id=?", (mid,))
         con.commit()
 
-def match_exists_by_ext(ext_id: str) -> bool:
+def (await adb(match_exists_by_ext, ext_id: str)) -> bool:
     with db() as con:
         r = con.execute("SELECT 1 FROM matches WHERE external_id=?", (ext_id,)).fetchone()
         return r is not None
@@ -386,7 +444,7 @@ def create_match(title: str, featured: int = 0, mult: float = 1.0, external_id: 
         return int(cur.lastrowid)
 
 def get_match_multiplier(mid: int) -> float:
-    m = get_match(mid)
+    m = await adb(get_match, mid)
     if not m:
         return 1.0
     if int(m["is_featured"]) == 1:
@@ -397,13 +455,7 @@ def get_match_multiplier(mid: int) -> float:
     return 1.0
 
 def match_stats(mid: int) -> Tuple[dict, dict]:
-    with db() as con:
-        rows = con.execute("""
-            SELECT bet_type, choice, COUNT(*) as c
-            FROM votes
-            WHERE match_id=?
-            GROUP BY bet_type, choice
-        """, (mid,)).fetchall()
+    rows = await adb(db_fetch_my_votes, message.from_user.id)
         totals = con.execute("""
             SELECT bet_type, COUNT(*) as c
             FROM votes
@@ -424,7 +476,7 @@ def is_following(follower_id: int, followee_id: int) -> bool:
         r = con.execute("SELECT 1 FROM follows WHERE follower_id=? AND followee_id=?", (follower_id, followee_id)).fetchone()
         return r is not None
 
-def follow_user(follower_id: int, followee_id: int) -> str:
+def (await adb(follow_user, follower_id: int, followee_id: int)) -> str:
     if follower_id == followee_id:
         return "self"
     with db() as con:
@@ -436,7 +488,7 @@ def follow_user(follower_id: int, followee_id: int) -> str:
         except sqlite3.IntegrityError:
             return "already"
 
-def unfollow_user(follower_id: int, followee_id: int):
+def un(await adb(follow_user, follower_id: int, followee_id: int)):
     with db() as con:
         con.execute("DELETE FROM follows WHERE follower_id=? AND followee_id=?", (follower_id, followee_id))
         con.commit()
@@ -451,7 +503,7 @@ def count_following(uid: int) -> int:
         r = con.execute("SELECT COUNT(*) as c FROM follows WHERE follower_id=?", (uid,)).fetchone()
         return int(r["c"])
 
-def find_user_by_username(username: str) -> Optional[int]:
+def (await adb(find_user_by_username, username: str)) -> Optional[int]:
     u = (username or "").strip()
     if u.startswith("@"):
         u = u[1:]
@@ -608,7 +660,7 @@ def claim_task_reward(season: str, user_id: int, username: Optional[str], task_k
             WHERE user_id=? AND day=? AND task_key=?
         """, (user_id, day, task_key))
 
-        ensure_score_row(season, user_id, username)
+        await adb(ensure_score_row, season, user_id, username)
         con.execute("""
             UPDATE scores_season
             SET points=points+?, username=COALESCE(?, username)
@@ -694,12 +746,7 @@ def get_duel_choice(duel_id: int, user_id: int) -> Optional[str]:
 
 def find_active_duels_for_vote(user_id: int, match_id: int, bet_type: str) -> List[int]:
     season = current_season()
-    with db() as con:
-        rows = con.execute("""
-            SELECT id FROM duels
-            WHERE season=? AND match_id=? AND bet_type=? AND status='accepted'
-              AND (challenger_id=? OR opponent_id=?)
-        """, (season, match_id, bet_type, user_id, user_id)).fetchall()
+    rows = await adb(db_fetch_my_votes, message.from_user.id)
         return [int(r["id"]) for r in rows]
 
 def upsert_duel_stats(season: str, user_id: int, username: Optional[str]):
@@ -795,9 +842,8 @@ def set_result_and_score(mid: int, bet_type: str, result: str) -> Tuple[str, int
             uname = v["username"]
             choice = v["choice"]
 
-            ensure_score_row(season, uid, uname)
-            ensure_daily_tasks(uid)
-
+            await adb(ensure_score_row, season, uid, uname)
+            await adb(ensure_daily_tasks, uid)
             con.execute("""
                 UPDATE scores_season
                 SET total=total+1, username=COALESCE(?, username)
@@ -908,7 +954,7 @@ def fetch_today_fixtures_from_fd(day_yyyy_mm_dd: str) -> list:
         logging.exception("football-data fetch failed")
         return [{"__error__": str(e), "__url__": url}]
 
-def pending_save(ext_id: str, day: str, title: str, kickoff_utc: str, competition: str) -> Optional[int]:
+def (await adb(pending_save, ext_id: str, day: str, title: str, kickoff_utc: str, competition: str)) -> Optional[int]:
     with db() as con:
         try:
             con.execute("""
@@ -921,11 +967,11 @@ def pending_save(ext_id: str, day: str, title: str, kickoff_utc: str, competitio
         except sqlite3.IntegrityError:
             return None
 
-def pending_get(pid: int):
+def (await adb(pending_get, pid: int)):
     with db() as con:
         return con.execute("SELECT * FROM pending_fixtures WHERE id=?", (pid,)).fetchone()
 
-def pending_delete(pid: int):
+def (await adb(pending_delete, pid: int)):
     with db() as con:
         con.execute("DELETE FROM pending_fixtures WHERE id=?", (pid,))
         con.commit()
@@ -965,7 +1011,7 @@ async def sync_today_internal(bot: Bot, requested_by: str = "auto"):
         ext_id = str(m.get("id") or "").strip()
         if not ext_id:
             continue
-        if match_exists_by_ext(ext_id):
+        if (await adb(match_exists_by_ext, ext_id)):
             skipped += 1
             continue
 
@@ -977,7 +1023,7 @@ async def sync_today_internal(bot: Bot, requested_by: str = "auto"):
         title = f"{home} vs {away}"
         kickoff = (m.get("utcDate") or "").strip()
 
-        pid = pending_save(ext_id, day, title, kickoff, comp_code)
+        pid = (await adb(pending_save, ext_id, day, title, kickoff, comp_code))
         if not pid:
             continue
 
@@ -1170,7 +1216,7 @@ def profile_text(season: str, urow, srow) -> str:
         acc = 0.0
 
     wins, losses, draws = get_duel_stats(season, int(urow["user_id"]))
-    ensure_daily_tasks(int(urow["user_id"]))
+    await adb(ensure_daily_tasks, int(urow["user_id"]))
     ttxt = tasks_text(int(urow["user_id"]))
 
     return (
@@ -1195,11 +1241,10 @@ async def start(message: Message):
     + Поддержка deep-link:
       /start profile_123 -> показать публичный профиль
     """
-    upsert_user(message)
-    ensure_score_row(current_season(), message.from_user.id, message.from_user.username)
-    ensure_daily_tasks(message.from_user.id)
-    set_state(message.from_user.id, None)
-
+    await adb(upsert_user, message)
+    await adb(ensure_score_row, current_season(), message.from_user.id, message.from_user.username)
+    await adb(ensure_daily_tasks, message.from_user.id)
+    await adb(set_state, message.from_user.id, None)
     arg = (message.text or "").split(maxsplit=1)
     payload = arg[1].strip() if len(arg) > 1 else ""
 
@@ -1214,7 +1259,7 @@ async def start(message: Message):
 
 @dp.message(Command("whoami"))
 async def whoami(message: Message):
-    upsert_user(message)
+    await adb(upsert_user, message)
     await message.answer(
         "🧩 Диагностика\n"
         f"Твой id: {message.from_user.id}\n"
@@ -1230,15 +1275,15 @@ async def whoami(message: Message):
 
 @dp.message(F.text == BTN_BACK)
 async def back_to_main(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, None)
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, None)
     await message.answer("Главное меню 👇", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
 
 @dp.message(F.text == BTN_ACTIVE)
 async def active_matches(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, None)
-    matches = get_open_matches()
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, None)
+    matches = await adb(get_open_matches)
     if not matches:
         await message.answer("Нет активных матчей.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
         return
@@ -1246,15 +1291,14 @@ async def active_matches(message: Message):
 
 @dp.message(F.text.startswith("🏟 #"))
 async def picked_match(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, None)
-
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, None)
     mid = parse_match_button(message.text)
     if mid is None:
         await message.answer("Не понял матч. Нажми «⚽ Активные матчи» ещё раз.")
         return
 
-    row = get_match(mid)
+    row = await adb(get_match, mid)
     if not row:
         await message.answer("Матч не найден. Обнови список: «⚽ Активные матчи».")
         return
@@ -1270,11 +1314,10 @@ async def picked_match(message: Message):
 
 @dp.callback_query(F.data.startswith("match:"))
 async def match_menu(call: CallbackQuery):
-    upsert_user(call)
-
+    await adb(upsert_user, call)
     _, mid, action = call.data.split(":")
     mid = int(mid)
-    row = get_match(mid)
+    row = await adb(get_match, mid)
     if not row:
         await call.answer("Матч не найден.", show_alert=True)
         return
@@ -1298,10 +1341,10 @@ async def match_menu(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("type:vote:"))
 async def choose_type_vote(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     _, _, mid, bt = call.data.split(":")
     mid = int(mid)
-    m = get_match(mid)
+    m = await adb(get_match, mid)
     if not m or m["status"] != "open":
         await call.answer("Матч закрыт/не найден.", show_alert=True)
         return
@@ -1318,25 +1361,19 @@ async def choose_type_vote(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("vote:"))
 async def vote_cb(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     _, mid, bt, choice = call.data.split(":", 3)
     mid = int(mid)
 
-    m = get_match(mid)
+    m = await adb(get_match, mid)
     if not m or m["status"] != "open":
         await call.answer("Матч закрыт.", show_alert=True)
         return
 
     season = current_season()
-    ensure_score_row(season, call.from_user.id, call.from_user.username)
-    ensure_daily_tasks(call.from_user.id)
-
-    with db() as con:
-        con.execute("""
-            INSERT OR REPLACE INTO votes(match_id,user_id,username,bet_type,choice,created_at)
-            VALUES(?,?,?,?,?,?)
-        """, (mid, call.from_user.id, call.from_user.username, bt, choice, now_iso()))
-        con.commit()
+    await adb(ensure_score_row, season, call.from_user.id, call.from_user.username)
+    await adb(ensure_daily_tasks, call.from_user.id)
+    await adb(db_save_vote, mid, call.from_user.id, call.from_user.username, bt, choice)
 
     inc_task_progress(call.from_user.id, "pred_3", 1)
 
@@ -1349,18 +1386,9 @@ async def vote_cb(call: CallbackQuery):
 
 @dp.message(F.text == BTN_MY)
 async def my_votes(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, None)
-
-    with db() as con:
-        rows = con.execute("""
-            SELECT v.match_id, m.title, v.bet_type, v.choice, m.status, v.created_at,
-                   m.is_featured, m.bonus_multiplier
-            FROM votes v
-            JOIN matches m ON m.id=v.match_id
-            WHERE v.user_id=?
-            ORDER BY v.match_id DESC, v.created_at DESC
-        """, (message.from_user.id,)).fetchall()
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, None)
+    rows = await adb(db_fetch_my_votes, message.from_user.id)
 
     if not rows:
         await message.answer("Ты ещё не делал прогнозов.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
@@ -1379,18 +1407,10 @@ async def my_votes(message: Message):
 
 @dp.message(F.text == BTN_LB)
 async def leaderboard(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, None)
-
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, None)
     season = current_season()
-    with db() as con:
-        rows = con.execute("""
-            SELECT COALESCE(username,'') as username, user_id, points, correct, total
-            FROM scores_season
-            WHERE season=?
-            ORDER BY points DESC, user_id ASC
-            LIMIT 20
-        """, (season,)).fetchall()
+    rows = await adb(db_fetch_my_votes, message.from_user.id)
 
     if not rows:
         await message.answer("Пока нет очков в этом сезоне.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
@@ -1408,13 +1428,13 @@ async def leaderboard(message: Message):
 
 @dp.message(F.text == BTN_PROFILE)
 async def my_profile(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, None)
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, None)
     await send_profile(message, message.from_user.id)
 
 async def send_profile(message_or_call, target_user_id: int):
     season = current_season()
-    urow, srow = get_profile(season, target_user_id)
+    urow, srow = await adb(get_profile, season, target_user_id)
     if not urow:
         if isinstance(message_or_call, Message):
             await message_or_call.answer("Профиль не найден.")
@@ -1423,8 +1443,8 @@ async def send_profile(message_or_call, target_user_id: int):
         return
 
     viewer_id = message_or_call.from_user.id
-    text = profile_text(season, urow, srow)
-    kb = profile_kb(viewer_id, target_user_id)
+    text = await adb(profile_text, season, urow, srow)
+    kb = await adb(profile_kb, viewer_id, target_user_id)
 
     if isinstance(message_or_call, Message):
         await message_or_call.answer(text, disable_web_page_preview=True)
@@ -1437,12 +1457,12 @@ async def send_profile(message_or_call, target_user_id: int):
 
 @dp.callback_query(F.data.startswith("follow:"))
 async def follow_cb(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     _, target_id_str, mode = call.data.split(":")
     target_id = int(target_id_str)
 
     if mode == "on":
-        res = follow_user(call.from_user.id, target_id)
+        res = (await adb(follow_user, call.from_user.id, target_id))
         if res == "self":
             await call.answer("Нельзя подписаться на себя 🙂", show_alert=True)
             return
@@ -1452,14 +1472,14 @@ async def follow_cb(call: CallbackQuery):
             await call.answer("Подписка оформлена ⭐", show_alert=True)
             await safe_dm(call.bot, target_id, "⭐ У тебя новый подписчик!")
     else:
-        unfollow_user(call.from_user.id, target_id)
+        un(await adb(follow_user, call.from_user.id, target_id))
         await call.answer("Отписался ✅", show_alert=True)
 
     await send_profile(call, target_id)
 
 @dp.callback_query(F.data.startswith("share:"))
 async def share_profile(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     _, target_id_str = call.data.split(":")
     target_id = int(target_id_str)
     if not BOT_USERNAME:
@@ -1471,33 +1491,37 @@ async def share_profile(call: CallbackQuery):
 
 @dp.message(F.text == BTN_FIND)
 async def find_player_start(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, "await_find_username")
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, "await_find_username")
     await message.answer("🔎 Напиши @username игрока (он должен хотя бы раз запустить бота).",
                          reply_markup=main_menu_kb(is_admin(message.from_user.id)))
 
 @dp.message(Command("find"))
 async def find_player_cmd(message: Message):
-    upsert_user(message)
+    await adb(upsert_user, message)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        set_state(message.from_user.id, "await_find_username")
+        await adb(set_state, message.from_user.id, "await_find_username")
         await message.answer("Напиши @username игрока (или просто username).")
         return
     username = parts[1].strip()
-    uid = find_user_by_username(username)
+    uid = (await adb(find_user_by_username, username))
     if not uid:
         await message.answer("Не нашёл такого игрока. Проверь @username.")
         return
-    set_state(message.from_user.id, None)
+    await adb(set_state, message.from_user.id, None)
     await send_profile(message, uid)
 
-@dp.message(lambda m: get_state(m.from_user.id) == "await_find_username")
+@dp.message()
 async def find_player_input(message: Message):
-    upsert_user(message)
+    # state-driven handler (async-safe)
+    st = await adb(get_state, message.from_user.id)
+    if st != "await_find_username":
+        return
+    await adb(upsert_user, message)
     username = (message.text or "").strip()
-    uid = find_user_by_username(username)
-    set_state(message.from_user.id, None)
+    uid = (await adb(find_user_by_username, username))
+    await adb(set_state, message.from_user.id, None)
     if not uid:
         await message.answer("Не нашёл игрока. Проверь @username или пусть он запустит бота.")
         return
@@ -1505,8 +1529,8 @@ async def find_player_input(message: Message):
 
 @dp.message(F.text == BTN_HELP)
 async def help_menu(message: Message):
-    upsert_user(message)
-    set_state(message.from_user.id, None)
+    await adb(upsert_user, message)
+    await adb(set_state, message.from_user.id, None)
     await message.answer(
         "ℹ️ Помощь\n\n"
         "• «⚽ Активные матчи» → выбери матч → прогноз/статистика\n"
@@ -1524,10 +1548,10 @@ async def help_menu(message: Message):
 
 @dp.callback_query(F.data.startswith("task:claim:"))
 async def task_claim(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     season = current_season()
     key = call.data.split(":")[2]
-    ensure_daily_tasks(call.from_user.id)
+    await adb(ensure_daily_tasks, call.from_user.id)
     ok, msg = claim_task_reward(season, call.from_user.id, call.from_user.username, key)
     await call.answer(msg, show_alert=True)
     await notify_rank_change(call.bot, season, call.from_user.id)
@@ -1535,7 +1559,7 @@ async def task_claim(call: CallbackQuery):
 
 @dp.message(F.text == BTN_NEW)
 async def newmatch_hint(message: Message):
-    upsert_user(message)
+    await adb(upsert_user, message)
     if not is_admin(message.from_user.id):
         return
     await message.answer(
@@ -1550,19 +1574,19 @@ async def newmatch_hint(message: Message):
 
 @dp.message(Command("newmatch"))
 async def newmatch_cmd(message: Message):
-    upsert_user(message)
+    await adb(upsert_user, message)
     if not is_admin(message.from_user.id):
         return
     title = (message.text or "").replace("/newmatch", "", 1).strip()
     if not title:
         await message.answer("Формат: /newmatch <название>")
         return
-    mid = create_match(title)
+    mid = await adb(create_match, title)
     await message.answer(f"Матч создан ✅ #{mid}")
 
 @dp.message(Command("newfeatured"))
 async def newfeatured_cmd(message: Message):
-    upsert_user(message)
+    await adb(upsert_user, message)
     if not is_admin(message.from_user.id):
         return
     parts = (message.text or "").split(maxsplit=2)
@@ -1575,19 +1599,19 @@ async def newfeatured_cmd(message: Message):
         await message.answer("Множитель должен быть числом")
         return
     title = parts[2].strip()
-    mid = create_match(title, featured=1, mult=mult)
+    mid = await adb(create_match, title, featured=1, mult=mult)
     await message.answer(f"⭐ Матч дня создан ✅ #{mid} (x{mult:g})")
 
 @dp.message(Command("sync_today"))
 async def sync_today_cmd(message: Message):
-    upsert_user(message)
+    await adb(upsert_user, message)
     if not is_admin(message.from_user.id):
         return
     await sync_today_internal(message.bot, requested_by="manual")
 
 @dp.callback_query(F.data.startswith("pf:"))
 async def pending_fixture_actions(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     if not is_admin(call.from_user.id):
         await call.answer("Только админ", show_alert=True)
         return
@@ -1597,53 +1621,53 @@ async def pending_fixture_actions(call: CallbackQuery):
     pid = int(parts[2])
     mult = float(parts[3]) if len(parts) > 3 else 2.0
 
-    p = pending_get(pid)
+    p = (await adb(pending_get, pid))
     if not p:
         await call.answer("Уже обработано.", show_alert=True)
         return
 
     if action == "skip":
-        pending_delete(pid)
+        (await adb(pending_delete, pid))
         await call.message.edit_text(call.message.text + "\n\n❌ Пропущено")
         await call.answer()
         return
 
-    if match_exists_by_ext(p["ext_id"]):
-        pending_delete(pid)
+    if (await adb(match_exists_by_ext, p["ext_id"])):
+        (await adb(pending_delete, pid))
         await call.message.edit_text(call.message.text + "\n\n⚠️ Уже добавлено ранее (дубликат).")
         await call.answer()
         return
 
     if action == "add":
-        create_match(p["title"], featured=0, mult=1.0, external_id=p["ext_id"])
-        pending_delete(pid)
+        await adb(create_match, p["title"], featured=0, mult=1.0, external_id=p["ext_id"])
+        (await adb(pending_delete, pid))
         await call.message.edit_text(call.message.text + "\n\n✅ Добавлено в активные матчи")
         await call.answer()
         return
 
     if action == "feat":
-        create_match(p["title"], featured=1, mult=mult, external_id=p["ext_id"])
-        pending_delete(pid)
+        await adb(create_match, p["title"], featured=1, mult=mult, external_id=p["ext_id"])
+        (await adb(pending_delete, pid))
         await call.message.edit_text(call.message.text + f"\n\n⭐ Добавлено как Матч дня (x{mult:g})")
         await call.answer()
         return
 
 @dp.callback_query(F.data.startswith("admin:"))
 async def admin_actions(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     if not is_admin(call.from_user.id):
         await call.answer("Только админ.", show_alert=True)
         return
 
     _, mid, action = call.data.split(":")
     mid = int(mid)
-    row = get_match(mid)
+    row = await adb(get_match, mid)
     if not row:
         await call.answer("Матч не найден.", show_alert=True)
         return
 
     if action == "close":
-        close_match(mid)
+        await adb(close_match, mid)
         await call.answer("Матч закрыт ✅", show_alert=True)
         await call.message.edit_text(
             f"Матч #{mid}: {row['title']}\nСтатус: closed\n\nВыбирай действие:",
@@ -1661,7 +1685,7 @@ async def admin_actions(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("type:setres:"))
 async def choose_type_setres(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     if not is_admin(call.from_user.id):
         await call.answer("Только админ.", show_alert=True)
         return
@@ -1681,14 +1705,14 @@ async def choose_type_setres(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("setr:"))
 async def set_result_cb(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     if not is_admin(call.from_user.id):
         await call.answer("Только админ.", show_alert=True)
         return
 
     _, mid, bt, result = call.data.split(":", 3)
     mid = int(mid)
-    m = get_match(mid)
+    m = await adb(get_match, mid)
     if not m:
         await call.answer("Матч не найден.", show_alert=True)
         return
@@ -1704,12 +1728,7 @@ async def set_result_cb(call: CallbackQuery):
 
     season = current_season()
 
-    with db() as con:
-        voters = con.execute("""
-            SELECT user_id, COALESCE(username,'') as username, choice
-            FROM votes
-            WHERE match_id=? AND bet_type=?
-        """, (mid, bt)).fetchall()
+    voters = await adb(db_fetch_voters, mid, bt)
 
     mult = get_match_multiplier(mid)
     mult_line = f"⭐ Матч дня! Множитель: x{mult:g}\n" if mult != 1.0 else ""
@@ -1728,11 +1747,7 @@ async def set_result_cb(call: CallbackQuery):
                 parts.append(f"{choice_label(bt, opt)} {pct:.0f}%")
             crowd_line = "👥 Толпа: " + " • ".join(parts)
 
-        with db() as con2:
-            srow = con2.execute("""
-                SELECT points, streak FROM scores_season
-                WHERE season=? AND user_id=?
-            """, (season, uid)).fetchone()
+        srow = await adb(db_fetch_user_points_streak, season, uid)
         pts = int(srow["points"]) if srow else 0
         streak = int(srow["streak"]) if srow else 0
 
@@ -1795,12 +1810,12 @@ def duel_invite_kb(duel_id: int):
 
 @dp.callback_query(F.data.startswith("duel:start:"))
 async def duel_start(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     target_id = int(call.data.split(":")[2])
     if target_id == call.from_user.id:
         await call.answer("Нельзя вызвать себя 🙂", show_alert=True)
         return
-    matches = get_open_matches()
+    matches = await adb(get_open_matches)
     if not matches:
         await call.answer("Сейчас нет активных матчей", show_alert=True)
         return
@@ -1809,12 +1824,12 @@ async def duel_start(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("duel:pickmatch:"))
 async def duel_pickmatch(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     _, _, target_id, mid = call.data.split(":")
     target_id = int(target_id)
     mid = int(mid)
 
-    m = get_match(mid)
+    m = await adb(get_match, mid)
     if not m or m["status"] != "open":
         await call.answer("Матч недоступен", show_alert=True)
         return
@@ -1824,7 +1839,7 @@ async def duel_pickmatch(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("duel:picktype:"))
 async def duel_picktype(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     _, _, target_id, mid, bt = call.data.split(":")
     target_id = int(target_id)
     mid = int(mid)
@@ -1833,7 +1848,7 @@ async def duel_picktype(call: CallbackQuery):
         await call.answer("Нельзя вызвать себя 🙂", show_alert=True)
         return
 
-    m = get_match(mid)
+    m = await adb(get_match, mid)
     if not m or m["status"] != "open":
         await call.answer("Матч недоступен", show_alert=True)
         return
@@ -1863,7 +1878,7 @@ async def duel_picktype(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("duel:accept:"))
 async def duel_accept(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     duel_id = int(call.data.split(":")[2])
     d = get_duel(duel_id)
     if not d:
@@ -1892,7 +1907,7 @@ async def duel_accept(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("duel:decline:"))
 async def duel_decline(call: CallbackQuery):
-    upsert_user(call)
+    await adb(upsert_user, call)
     duel_id = int(call.data.split(":")[2])
     d = get_duel(duel_id)
     if not d:
@@ -2000,6 +2015,12 @@ async def main():
     BOT_USERNAME = me.username
 
     asyncio.create_task(auto_sync_loop(bot))
+
+    async def _heartbeat():
+        while True:
+            logging.info("HEARTBEAT: bot alive")
+            await asyncio.sleep(300)
+    asyncio.create_task(_heartbeat())
 
     await dp.start_polling(bot)
 
