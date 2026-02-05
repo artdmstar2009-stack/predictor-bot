@@ -18,12 +18,14 @@ import json
 import math
 import asyncio
 import logging
+import time
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional, List, Tuple, Dict
 
 import aiohttp
+from bs4 import BeautifulSoup
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
@@ -64,10 +66,16 @@ AUTO_SYNC_TZ = os.getenv("AUTO_SYNC_TZ", "Europe/London")  # IANA tz
 
 HTTP_PORT = int(os.getenv("PORT", "10000"))
 
+LIQUIPEDIA_USER_AGENT = os.getenv("LIQUIPEDIA_USER_AGENT", "MyPredBot/1.0 (contact: @telegram)")
+LIQUIPEDIA_RATE_LIMIT_SECONDS = float(os.getenv("LIQUIPEDIA_RATE_LIMIT_SECONDS", "2.0"))
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
 # ------------------------- Helpers -------------------------
+
+LIQUI_LAST_CALL = 0.0
+LIQUI_LOCK = asyncio.Lock()
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -585,6 +593,142 @@ def _nhl_extract_games(payload: dict) -> List[dict]:
             return games
     return []
 
+
+# ------------------------- Liquipedia (Esports) via CargoQuery -------------------------
+
+def _liqui_api_base(wiki: str) -> str:
+    wiki = wiki.strip().lower()
+    return f"https://liquipedia.net/{wiki}/api.php"
+
+async def liqui_get_json(session: aiohttp.ClientSession, url: str, params: dict) -> dict:
+    global LIQUI_LAST_CALL
+    async with LIQUI_LOCK:
+        now = time.time()
+        wait = LIQUIPEDIA_RATE_LIMIT_SECONDS - (now - LIQUI_LAST_CALL)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        LIQUI_LAST_CALL = time.time()
+    headers = {
+        "User-Agent": LIQUIPEDIA_USER_AGENT,
+        "Accept-Encoding": "gzip",
+    }
+    async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+async def liqui_cargoquery(wiki: str, tables: str, fields: str, where: str, limit: int = 50, order_by: str = "") -> list[dict]:
+    """
+    Uses Liquipedia CargoQuery API to get structured match data.
+    This is far more stable than scraping HTML and allows reliable results extraction.
+    """
+    url = _liqui_api_base(wiki)
+    params = {
+        "action": "cargoquery",
+        "format": "json",
+        "tables": tables,
+        "fields": fields,
+        "where": where,
+        "limit": str(limit),
+    }
+    if order_by:
+        params["order_by"] = order_by
+    async with aiohttp.ClientSession() as session:
+        data = await liqui_get_json(session, url, params=params)
+    items = data.get("cargoquery") or []
+    out: list[dict] = []
+    for it in items:
+        title = it.get("title") or {}
+        if isinstance(title, dict):
+            out.append(title)
+    return out
+
+def _liqui_dt_range_for_today_utc() -> tuple[str, str]:
+    d0 = datetime.now(timezone.utc).date()
+    start = datetime(d0.year, d0.month, d0.day, 0, 0, 0, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    # Cargo stores DateTime_UTC like 'YYYY-MM-DD HH:MM:SS'
+    return (
+        start.strftime("%Y-%m-%d %H:%M:%S"),
+        end.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+async def liqui_today_matches(wiki: str, discipline: str, max_items: int = 25) -> List[dict]:
+    """
+    Returns list of matches for today (UTC) from Liquipedia Cargo tables.
+    We query MatchSchedule (MS) which stores series-level match info.
+    """
+    start_s, end_s = _liqui_dt_range_for_today_utc()
+    # Note: Some wikis may use different capitalization; Cargo is case-sensitive for field names.
+    fields = "MatchId,DateTime_UTC,Team1,Team2,OverviewPage,BestOf,Winner,Team1Score,Team2Score"
+    where = f'DateTime_UTC >= "{start_s}" AND DateTime_UTC < "{end_s}"'
+    rows = await liqui_cargoquery(
+        wiki=wiki,
+        tables="MatchSchedule=MS",
+        fields=fields,
+        where=where,
+        limit=max_items,
+        order_by="DateTime_UTC ASC",
+    )
+
+    out: List[dict] = []
+    for r in rows:
+        t1 = (r.get("Team1") or "").strip()
+        t2 = (r.get("Team2") or "").strip()
+        dt = (r.get("DateTime_UTC") or "").strip()
+        mid = (r.get("MatchId") or "").strip()
+        if not (t1 and t2 and dt and mid):
+            continue
+        try:
+            kickoff = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        comp = (r.get("OverviewPage") or discipline or "Liquipedia").strip()
+        ext_id = f"lp:{wiki}:{mid}"
+        out.append({
+            "ext_id": ext_id,
+            "home": t1,
+            "away": t2,
+            "competition": comp,
+            "kickoff_utc": kickoff.isoformat(),
+        })
+    return out
+
+async def liqui_match_result(wiki: str, ext_id: str) -> Optional[Tuple[int, int]]:
+    """
+    Returns (team1score, team2score) if match finished and scores known, else None.
+    ext_id format: lp:<wiki>:<MatchId>
+    """
+    try:
+        parts = ext_id.split(":")
+        match_id = parts[-1]
+    except Exception:
+        match_id = ext_id
+
+    fields = "MatchId,Winner,Team1Score,Team2Score"
+    where = f'MatchId = "{match_id}"'
+    rows = await liqui_cargoquery(
+        wiki=wiki,
+        tables="MatchSchedule=MS",
+        fields=fields,
+        where=where,
+        limit=1,
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    winner = (r.get("Winner") or "").strip()
+    s1 = (r.get("Team1Score") or "").strip()
+    s2 = (r.get("Team2Score") or "").strip()
+    if not winner:
+        return None
+    try:
+        hs = int(float(s1)) if s1 != "" else None
+        as_ = int(float(s2)) if s2 != "" else None
+    except Exception:
+        return None
+    if hs is None or as_ is None:
+        return None
+    return (hs, as_)
 async def nhl_today_matches() -> List[NHLMatch]:
     d = date.today().isoformat()
     url = f"https://api-web.nhle.com/v1/schedule/{d}"
@@ -662,7 +806,6 @@ main_kb = ReplyKeyboardMarkup(
 
 
 
-@router.message(F.text == "❓ Помощь")
 async def help_menu(message: Message):
     user = await get_user_or_prompt(message)
     if isinstance(user, sqlite3.Row):
@@ -841,6 +984,9 @@ def kb_duel_pick_outcome(duel_id: int) -> InlineKeyboardMarkup:
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# register help handler (function defined выше)
+dp.message.register(help_menu, F.text == "❓ Помощь")
+
 # In-memory cache for pending sync cards mapping ext_id -> FDMatch
 SYNC_CACHE: Dict[str, dict] = {}
 
@@ -901,6 +1047,46 @@ async def cmd_sync_today(message: Message):
         if shown == 0:
             return await message.answer("На сегодня подходящих матчей NHL нет.")
         return
+
+
+    if sport == "esports":
+        discipline = (league or "CS2").upper()
+        wiki_map = {"CS2": "counterstrike", "CSGO": "counterstrike", "DOTA2": "dota2", "LOL": "leagueoflegends"}
+        wiki = wiki_map.get(discipline, "counterstrike")
+        await message.answer(f"🔄 Тяну матчи {discipline} на сегодня из Liquipedia…")
+        try:
+            items = await liqui_today_matches(wiki, discipline, max_items=25)
+        except Exception as e:
+            logger.exception("sync_today liquipedia failed")
+            return await message.answer(f"Ошибка Liquipedia: {e}")
+
+        now = utcnow()
+        shown = 0
+        for it in items:
+            kickoff = parse_utc(it["kickoff_utc"])
+            if kickoff <= now + timedelta(seconds=PREDICTION_CLOSE_SECONDS):
+                continue
+            cache_key = it["ext_id"] or f"lp:{wiki}:{it['home']}_{it['away']}_{it['kickoff_utc']}"
+            SYNC_CACHE[cache_key] = {
+                "ext_id": cache_key,
+                "sport": "esports",
+                "league": discipline,
+                "competition": discipline,
+                "home": it["home"],
+                "away": it["away"],
+                "kickoff_utc": it["kickoff_utc"],
+            }
+            text_card = (f"🎮 <b>{discipline}</b> (Liquipedia)\n"
+                         f"📌 <b>{it['home']} — {it['away']}</b>\n"
+                         f"🕒 {fmt_kickoff_local(it['kickoff_utc'])}")
+            await message.answer(text_card, reply_markup=kb_admin_sync(cache_key))
+            shown += 1
+            if shown >= 25:
+                break
+        if shown == 0:
+            return await message.answer("На сегодня подходящих киберспортивных матчей нет.")
+        return
+
 
     # default: football-data
     await message.answer("🔄 Тяну матчи на сегодня из football-data…")
@@ -1387,8 +1573,8 @@ async def loop_auto_finish():
                 if utcnow() < kickoff - timedelta(minutes=5):
                     continue
 
-                sport = (m.get("sport") or "football")
-                league = (m.get("league") or "")
+                sport = (m["sport"] if ("sport" in m.keys()) else None) or "football"
+                league = (m["league"] if ("league" in m.keys()) else None) or ""
 
                 if sport == "hockey" and league.upper() == "NHL":
                     gid = str(m["ext_id"]).split("nhl:")[-1] if str(m["ext_id"]).startswith("nhl:") else str(m["ext_id"])
@@ -1396,6 +1582,19 @@ async def loop_auto_finish():
                     if not g or not nhl_is_finished(g):
                         continue
                     hs, as_ = nhl_scores(g)
+                elif sport == "esports":
+                    # Liquipedia (best-effort score parsing)
+                    if utcnow() < kickoff + timedelta(minutes=20):
+                        continue
+                    wiki_map = {"CS2": "counterstrike", "DOTA2": "dota2", "LOL": "leagueoflegends"}
+                    wiki = wiki_map.get((league or "CS2").upper(), "counterstrike")
+                    try:
+                        res = await liqui_match_result(wiki, str(m["ext_id"]))
+                    except Exception:
+                        continue
+                    if not res:
+                        continue
+                    hs, as_ = res
                 else:
                     # football-data
                     data = await fd_match_status(str(m["ext_id"]))
