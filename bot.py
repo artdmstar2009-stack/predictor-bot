@@ -661,6 +661,29 @@ main_kb = ReplyKeyboardMarkup(
 )
 
 
+
+@router.message(F.text == "❓ Помощь")
+async def help_menu(message: Message):
+    user = await get_user_or_prompt(message)
+    if isinstance(user, sqlite3.Row):
+        user = dict(user)
+    sport = (user.get("sport") if user else None) or "—"
+    league = user.get("league") if user else None
+    chosen = sport_label(sport, league) if sport != "—" else "не выбран"
+    await message.answer(
+        "❓ Помощь\n\n"
+        f"Текущий спорт: {chosen}\n\n"
+        "Команды:\n"
+        "• /start — старт и выбор спорта\n"
+        "• 🏟 Выбрать спорт — сменить спорт\n"
+        "• ⚽ Активные матчи — список матчей\n"
+        "• 🧾 Мои прогнозы — твои ставки\n"
+        "• 🏆 Лидерборд — топ игроков\n"
+        "• ⚔️ Дуэли — пари против игроков\n\n"
+        "Прогнозы закрываются автоматически за 1–2 минуты до матча.",
+        reply_markup=main_kb,
+    )
+
 # ---- Sport selection (multisport skeleton) ----
 
 def sport_label(sport: str, league: Optional[str]) -> str:
@@ -714,14 +737,41 @@ async def get_user_or_prompt(message: Message) -> Optional[sqlite3.Row]:
         return None
     return user
 
-async def require_football_or_notice(message: Message) -> Optional[sqlite3.Row]:
+
+async def require_sport_selected(message: Message) -> Optional[dict]:
     user = await get_user_or_prompt(message)
     if not user:
         return None
-    if user["sport"] != "football":
+    # sqlite3.Row -> dict
+    if isinstance(user, sqlite3.Row):
+        user = dict(user)
+    if not user.get("sport"):
+        # Should not happen because get_user_or_prompt prompts, but keep safe
+        await message.answer("Выбери вид спорта 👇", reply_markup=sport_select_kb())
+        return None
+    return user
+
+
+def feature_supported(sport: str, league: Optional[str], feature: str) -> bool:
+    # feature: "matches", "predict", "leaderboard", "duels"
+    if sport == "football":
+        return True
+    if sport == "hockey" and (league or "").upper() == "NHL":
+        return True
+    if sport == "esports":
+        # menu is live, but providers (matches/results) are not wired yet
+        return feature in {"matches"}  # read-only matches placeholder for now
+    return False
+
+
+async def require_feature(message: Message, feature: str) -> Optional[dict]:
+    user = await require_sport_selected(message)
+    if not user:
+        return None
+    if not feature_supported(user["sport"], user.get("league"), feature):
         await message.answer(
-            f"Этот раздел пока доступен только для ⚽ футбола. Сейчас выбран: {sport_label(user['sport'], user['league'])}\n"
-            f"Нажми 🏟 Выбрать спорт и выбери ⚽ Футбол.",
+            f"Этот раздел пока недоступен для {sport_label(user['sport'], user.get('league'))}.\n"
+            f"Нажми 🏟 Выбрать спорт и выбери ⚽ Футбол или 🏒 NHL.",
             reply_markup=main_kb,
         )
         return None
@@ -925,7 +975,7 @@ async def pick_league(cb: CallbackQuery):
 
 @dp.message(F.text == "⚽ Активные матчи")
 async def active_matches(message: Message):
-    user = await require_football_or_notice(message)
+    user = await require_feature(message, 'leaderboard')
     if not user:
         return
     rows = await adb(_list_active_matches_by_sport_sync, user["sport"], user.get("league"))
@@ -941,7 +991,7 @@ async def active_matches(message: Message):
 
 @dp.message(F.text == "🏆 Лидерборд")
 async def leaderboard(message: Message):
-    user = await require_football_or_notice(message)
+    user = await require_feature(message, 'leaderboard')
     if not user:
         return
     rows = await adb(_top_users_sync, 20)
@@ -993,7 +1043,7 @@ async def profile(message: Message):
 
 @dp.message(F.text == "🧾 Мои прогнозы")
 async def my_preds(message: Message):
-    user = await require_football_or_notice(message)
+    user = await require_feature(message, 'predict')
     if not user:
         return
     rows = await adb(_user_predictions_sync, message.from_user.id, user['sport'], user.get('league'), 20)
@@ -1015,7 +1065,7 @@ async def my_preds(message: Message):
 
 @dp.message(F.text == "⚔️ Дуэли")
 async def duels_menu(message: Message):
-    user = await require_football_or_notice(message)
+    user = await require_feature(message, 'predict')
     if not user:
         return
     await message.answer(
