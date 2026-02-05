@@ -143,6 +143,16 @@ def _init_db_sync():
     )
     """)
 
+    # --- migrations (safe add columns) ---
+    for stmt in (
+        "ALTER TABLE users ADD COLUMN sport TEXT",
+        "ALTER TABLE users ADD COLUMN league TEXT",
+    ):
+        try:
+            cur.execute(stmt)
+        except Exception:
+            pass
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS matches (
         match_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,6 +239,14 @@ def _get_user_sync(user_id: int) -> sqlite3.Row:
     row = cur.fetchone()
     con.close()
     return row
+
+def _set_user_sport_sync(user_id: int, sport: str, league: Optional[str]):
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("UPDATE users SET sport=?, league=? WHERE user_id=?", (sport, league, user_id))
+    con.commit()
+    con.close()
+
 
 def _top_users_sync(limit: int = 20) -> List[sqlite3.Row]:
     con = _connect()
@@ -514,12 +532,80 @@ def outcome_from_score(hs: int, as_: int) -> str:
 
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏟 Выбрать спорт")],
         [KeyboardButton(text="⚽ Активные матчи"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text="🏆 Лидерборд"), KeyboardButton(text="🧾 Мои прогнозы")],
         [KeyboardButton(text="⚔️ Дуэли"), KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
 )
+
+
+# ---- Sport selection (multisport skeleton) ----
+
+def sport_label(sport: str, league: Optional[str]) -> str:
+    if sport == "football":
+        return "⚽ Футбол"
+    if sport == "hockey":
+        return f"🏒 Хоккей{f' ({league})' if league else ''}"
+    if sport == "esports":
+        return f"🎮 Киберспорт{f' ({league})' if league else ''}"
+    return sport
+
+def kb_choose_sport() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚽ Футбол", callback_data="sport:football")],
+        [InlineKeyboardButton(text="🏒 Хоккей", callback_data="sport:hockey")],
+        [InlineKeyboardButton(text="🎮 Киберспорт", callback_data="sport:esports")],
+    ])
+
+def kb_choose_hockey_league() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇺🇸 NHL", callback_data="league:hockey:NHL")],
+        [InlineKeyboardButton(text="🇷🇺 KHL", callback_data="league:hockey:KHL")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="sport_back")],
+    ])
+
+def kb_choose_esports_game() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔫 CS2", callback_data="league:esports:CS2")],
+        [InlineKeyboardButton(text="🧙 Dota 2", callback_data="league:esports:DOTA2")],
+        [InlineKeyboardButton(text="🧠 LoL", callback_data="league:esports:LOL")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="sport_back")],
+    ])
+
+async def prompt_choose_sport(target: Message | CallbackQuery, first_time: bool = False):
+    text = (
+        "👋 Добро пожаловать!\nВыбери вид спорта, с которого хочешь начать 👇"
+        if first_time else
+        "🏟 Выбери вид спорта 👇"
+    )
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=kb_choose_sport())
+    else:
+        await target.message.edit_text(text, reply_markup=kb_choose_sport())
+
+
+async def get_user_or_prompt(message: Message) -> Optional[sqlite3.Row]:
+    u = message.from_user
+    user = await adb(_get_user_sync, u.id)
+    if not user or not user["sport"]:
+        await prompt_choose_sport(message, first_time=True)
+        return None
+    return user
+
+async def require_football_or_notice(message: Message) -> Optional[sqlite3.Row]:
+    user = await get_user_or_prompt(message)
+    if not user:
+        return None
+    if user["sport"] != "football":
+        await message.answer(
+            f"Этот раздел пока доступен только для ⚽ футбола. Сейчас выбран: {sport_label(user['sport'], user['league'])}\n"
+            f"Нажми 🏟 Выбрать спорт и выбери ⚽ Футбол.",
+            reply_markup=main_kb,
+        )
+        return None
+    return user
 
 def match_card(mrow: sqlite3.Row) -> str:
     kickoff = parse_utc(mrow["kickoff_utc"]).astimezone(ZoneInfo(AUTO_SYNC_TZ))
@@ -605,7 +691,10 @@ SYNC_CACHE: Dict[str, FDMatch] = {}
 async def cmd_start(message: Message):
     u = message.from_user
     await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
-    await message.answer("Привет! Это бот прогнозов ⚽\nВыбирай в меню:", reply_markup=main_kb)
+    user = await adb(_get_user_sync, u.id)
+    if not user or not user["sport"]:
+        return await prompt_choose_sport(message, first_time=True)
+    await message.answer(f"Привет! Твой спорт: {sport_label(user['sport'], user['league'])}\nВыбирай в меню:", reply_markup=main_kb)
 
 @dp.message(Command("sync_today"))
 async def cmd_sync_today(message: Message):
@@ -650,8 +739,56 @@ async def help_msg(message: Message):
 
 # ------------------------- Menu buttons -------------------------
 
+
+@dp.message(F.text == "🏟 Выбрать спорт")
+async def choose_sport_menu(message: Message):
+    u = message.from_user
+    await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
+    await prompt_choose_sport(message, first_time=False)
+
+@dp.callback_query(F.data == "sport_back")
+async def sport_back(cb: CallbackQuery):
+    await prompt_choose_sport(cb, first_time=False)
+
+@dp.callback_query(F.data.startswith("sport:"))
+async def pick_sport(cb: CallbackQuery):
+    u = cb.from_user
+    await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
+    sport = cb.data.split(":", 1)[1]
+    if sport == "football":
+        await adb(_set_user_sport_sync, u.id, "football", None)
+        user = await adb(_get_user_sync, u.id)
+        await cb.message.edit_text(f"✅ Выбран спорт: {sport_label('football', None)}")
+        await cb.message.answer("Меню доступно ниже 👇", reply_markup=main_kb)
+        return await cb.answer()
+    if sport == "hockey":
+        await cb.message.edit_text("🏒 Хоккей\nВыбери лигу:", reply_markup=kb_choose_hockey_league())
+        return await cb.answer()
+    if sport == "esports":
+        await cb.message.edit_text("🎮 Киберспорт\nВыбери дисциплину:", reply_markup=kb_choose_esports_game())
+        return await cb.answer()
+    await cb.answer("Неизвестный спорт")
+
+@dp.callback_query(F.data.startswith("league:"))
+async def pick_league(cb: CallbackQuery):
+    u = cb.from_user
+    await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        return await cb.answer("Некорректный выбор")
+    sport = parts[1]
+    league = parts[2]
+    # пока реально поддержан только футбол — остальные идут как контекст/заглушка
+    await adb(_set_user_sport_sync, u.id, sport, league)
+    await cb.message.edit_text(f"✅ Выбран спорт: {sport_label(sport, league)}")
+    await cb.message.answer("Меню доступно ниже 👇", reply_markup=main_kb)
+    await cb.answer()
+
 @dp.message(F.text == "⚽ Активные матчи")
 async def active_matches(message: Message):
+    user = await require_football_or_notice(message)
+    if not user:
+        return
     rows = await adb(_list_active_matches_sync)
     if not rows:
         return await message.answer("Сегодня активных матчей нет.", reply_markup=main_kb)
@@ -664,6 +801,9 @@ async def active_matches(message: Message):
 
 @dp.message(F.text == "🏆 Лидерборд")
 async def leaderboard(message: Message):
+    user = await require_football_or_notice(message)
+    if not user:
+        return
     rows = await adb(_top_users_sync, 20)
     if not rows:
         return await message.answer("Пока нет данных по лидерборду.")
@@ -676,6 +816,9 @@ async def leaderboard(message: Message):
 
 @dp.message(F.text == "👤 Профиль")
 async def profile(message: Message):
+    user = await get_user_or_prompt(message)
+    if not user:
+        return
     u = message.from_user
     await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
     row = await adb(_get_user_sync, u.id)
@@ -710,6 +853,9 @@ async def profile(message: Message):
 
 @dp.message(F.text == "🧾 Мои прогнозы")
 async def my_preds(message: Message):
+    user = await require_football_or_notice(message)
+    if not user:
+        return
     rows = await adb(_user_predictions_sync, message.from_user.id, 20)
     if not rows:
         return await message.answer("У тебя пока нет прогнозов.")
@@ -729,6 +875,9 @@ async def my_preds(message: Message):
 
 @dp.message(F.text == "⚔️ Дуэли")
 async def duels_menu(message: Message):
+    user = await require_football_or_notice(message)
+    if not user:
+        return
     await message.answer(
         "⚔️ <b>Дуэли</b>\n"
         "• Создай дуэль с другом и поставьте 🪙 на матч.\n"
