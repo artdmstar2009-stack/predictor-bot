@@ -815,8 +815,8 @@ async def cmd_sync_today(message: Message):
     u = message.from_user
     await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
     admin_user = await adb(_get_user_sync, u.id)
-    sport = (admin_user.get("sport") or "football") if admin_user else "football"
-    league = (admin_user.get("league") or None) if admin_user else None
+    sport = (admin_user["sport"] if ("sport" in admin_user.keys()) else None or "football") if admin_user else "football"
+    league = (admin_user["league"] if ("league" in admin_user.keys()) else None or None) if admin_user else None
 
     if sport == "hockey" and (league or "").upper() == "NHL":
         await message.answer("🔄 Тяну матчи NHL на сегодня…")
