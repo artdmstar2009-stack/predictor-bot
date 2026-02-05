@@ -157,6 +157,8 @@ def _init_db_sync():
     CREATE TABLE IF NOT EXISTS matches (
         match_id INTEGER PRIMARY KEY AUTOINCREMENT,
         ext_id TEXT UNIQUE,
+        sport TEXT DEFAULT 'football',
+        league TEXT,
         competition TEXT,
         home TEXT,
         away TEXT,
@@ -198,6 +200,20 @@ def _init_db_sync():
         FOREIGN KEY(match_id) REFERENCES matches(match_id)
     )
     """)
+
+
+# --- migrations for multisport ---
+try:
+    cur.execute("PRAGMA table_info(matches)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "sport" not in cols:
+        cur.execute("ALTER TABLE matches ADD COLUMN sport TEXT DEFAULT 'football'")
+    if "league" not in cols:
+        cur.execute("ALTER TABLE matches ADD COLUMN league TEXT")
+    # backfill for old rows
+    cur.execute("UPDATE matches SET sport=COALESCE(sport,'football') WHERE sport IS NULL OR sport=''")
+except Exception:
+    pass
 
     con.commit()
     con.close()
@@ -291,6 +307,23 @@ def _list_active_matches_sync() -> List[sqlite3.Row]:
     con.close()
     return rows
 
+def _list_active_matches_by_sport_sync(sport: str, league: Optional[str]) -> List[sqlite3.Row]:
+    con = _connect()
+    cur = con.cursor()
+    if league:
+        cur.execute(
+            "SELECT * FROM matches WHERE sport=? AND league=? AND status IN ('open','closed') ORDER BY kickoff_utc ASC",
+            (sport, league),
+        )
+    else:
+        cur.execute(
+            "SELECT * FROM matches WHERE sport=? AND (league IS NULL OR league='') AND status IN ('open','closed') ORDER BY kickoff_utc ASC",
+            (sport,),
+        )
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
 def _get_match_sync(match_id: int) -> Optional[sqlite3.Row]:
     con = _connect()
     cur = con.cursor()
@@ -299,11 +332,11 @@ def _get_match_sync(match_id: int) -> Optional[sqlite3.Row]:
     con.close()
     return row
 
-def _insert_match_sync(ext_id: str, competition: str, home: str, away: str, kickoff_utc: str):
+def _insert_match_sync(ext_id: str, sport: str, league: Optional[str], competition: str, home: str, away: str, kickoff_utc: str):
     con = _connect()
     cur = con.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO matches (ext_id, competition, home, away, kickoff_utc, status, created_at) VALUES (?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO matches (ext_id, sport, league, competition, home, away, kickoff_utc, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
         (ext_id, competition, home, away, kickoff_utc, "open", iso_utc(utcnow())),
     )
     con.commit()
@@ -348,20 +381,38 @@ def _upsert_prediction_sync(match_id: int, user_id: int, outcome: str) -> str:
     con.close()
     return action
 
-def _user_predictions_sync(user_id: int, limit: int = 20) -> List[sqlite3.Row]:
+
+def _user_predictions_sync(user_id: int, sport: str, league: Optional[str], limit: int = 20) -> List[sqlite3.Row]:
     con = _connect()
     cur = con.cursor()
-    cur.execute("""
-        SELECT p.*, m.home, m.away, m.kickoff_utc, m.status, m.result, m.home_score, m.away_score
-        FROM predictions p
-        JOIN matches m ON m.match_id = p.match_id
-        WHERE p.user_id=?
-        ORDER BY m.kickoff_utc DESC
-        LIMIT ?
-    """, (user_id, limit))
+    if league:
+        cur.execute(
+            """
+            SELECT p.*, m.home, m.away, m.kickoff_utc, m.status, m.result, m.home_score, m.away_score, m.sport, m.league, m.competition
+            FROM predictions p
+            JOIN matches m ON m.match_id = p.match_id
+            WHERE p.user_id=? AND m.sport=? AND m.league=?
+            ORDER BY m.kickoff_utc DESC
+            LIMIT ?
+            """,
+            (user_id, sport, league, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT p.*, m.home, m.away, m.kickoff_utc, m.status, m.result, m.home_score, m.away_score, m.sport, m.league, m.competition
+            FROM predictions p
+            JOIN matches m ON m.match_id = p.match_id
+            WHERE p.user_id=? AND m.sport=? AND (m.league IS NULL OR m.league='')
+            ORDER BY m.kickoff_utc DESC
+            LIMIT ?
+            """,
+            (user_id, sport, limit),
+        )
     rows = cur.fetchall()
     con.close()
     return rows
+
 
 def _increment_user_stats_sync(user_id: int, correct: bool):
     con = _connect()
@@ -521,6 +572,89 @@ async def fd_match_status(ext_id: str) -> Optional[dict]:
     async with aiohttp.ClientSession() as session:
         return await fd_get_json(session, url)
 
+
+@dataclass
+class NHLMatch:
+    game_id: str
+    home: str
+    away: str
+    kickoff_utc: datetime
+
+async def nhl_get_json(session: aiohttp.ClientSession, url: str) -> dict:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+def _nhl_extract_games(payload: dict) -> List[dict]:
+    # API usually returns {"gameWeek":[{"games":[...]}], ...}
+    if isinstance(payload, dict):
+        if "games" in payload and isinstance(payload["games"], list):
+            return payload["games"]
+        gw = payload.get("gameWeek")
+        if isinstance(gw, list):
+            games: List[dict] = []
+            for w in gw:
+                if isinstance(w, dict) and isinstance(w.get("games"), list):
+                    games.extend(w["games"])
+            return games
+    return []
+
+async def nhl_today_matches() -> List[NHLMatch]:
+    d = date.today().isoformat()
+    url = f"https://api-web.nhle.com/v1/schedule/{d}"
+    async with aiohttp.ClientSession() as session:
+        data = await nhl_get_json(session, url)
+    games = _nhl_extract_games(data)
+    out: List[NHLMatch] = []
+    for g in games:
+        gid = str(g.get("id") or g.get("gameId") or "")
+        start = g.get("startTimeUTC") or g.get("startTimeUtc") or g.get("startTime") or g.get("gameDate")
+        if not gid or not start:
+            continue
+        kickoff = parse_utc(start)
+        home_team = (g.get("homeTeam") or {})
+        away_team = (g.get("awayTeam") or {})
+        home = home_team.get("abbrev") or home_team.get("placeName") or home_team.get("name") or "HOME"
+        away = away_team.get("abbrev") or away_team.get("placeName") or away_team.get("name") or "AWAY"
+        out.append(NHLMatch(game_id=gid, home=str(home), away=str(away), kickoff_utc=kickoff))
+    out.sort(key=lambda x: x.kickoff_utc)
+    return out
+
+async def nhl_game_status(game_id: str, kickoff: datetime) -> Optional[dict]:
+    # Use daily score endpoint; try kickoff date ±1 day to be safe with TZ.
+    for delta in (0, -1, 1):
+        d = (kickoff.date() + timedelta(days=delta)).isoformat()
+        url = f"https://api-web.nhle.com/v1/score/{d}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                data = await nhl_get_json(session, url)
+            games = _nhl_extract_games(data)
+            for g in games:
+                if str(g.get("id") or g.get("gameId") or "") == str(game_id):
+                    return g
+        except Exception:
+            continue
+    return None
+
+def nhl_is_finished(g: dict) -> bool:
+    state = (g.get("gameState") or g.get("gameStatus") or "").upper()
+    # observed states: FUT, PRE, LIVE, CRIT, FINAL, OFF
+    return state in {"FINAL", "OFF", "FINAL_OVER", "COMPLETED"}
+
+def nhl_scores(g: dict) -> Tuple[Optional[int], Optional[int]]:
+    # score object may be nested
+    hs = g.get("homeTeam", {}).get("score")
+    as_ = g.get("awayTeam", {}).get("score")
+    try:
+        hs = int(hs) if hs is not None else None
+    except Exception:
+        hs = None
+    try:
+        as_ = int(as_) if as_ is not None else None
+    except Exception:
+        as_ = None
+    return hs, as_
+
 def outcome_from_score(hs: int, as_: int) -> str:
     if hs > as_:
         return "1"
@@ -624,28 +758,17 @@ def kb_match_actions(match_id: int, allow_predict: bool) -> InlineKeyboardMarkup
     buttons.append([InlineKeyboardButton(text="📊 Голоса", callback_data=f"votes:{match_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def kb_pred_choices(match_id: int) -> InlineKeyboardMarkup:
+
+def kb_pred_choices(match_id: int, allow_draw: bool = True) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(text="🏠 1", callback_data=f"pick:{match_id}:1")]
+    if allow_draw:
+        row.append(InlineKeyboardButton(text="🤝 X", callback_data=f"pick:{match_id}:X"))
+    row.append(InlineKeyboardButton(text="🚩 2", callback_data=f"pick:{match_id}:2"))
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🏠 1", callback_data=f"pick:{match_id}:1"),
-            InlineKeyboardButton(text="🤝 X", callback_data=f"pick:{match_id}:X"),
-            InlineKeyboardButton(text="🚩 2", callback_data=f"pick:{match_id}:2"),
-        ],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"match:{match_id}")],
+        row,
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"match:{match_id}")]
     ])
 
-def kb_admin_sync(match: FDMatch) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Добавить", callback_data=f"admin_add:{match.ext_id}"),
-            InlineKeyboardButton(text="❌ Пропустить", callback_data=f"admin_skip:{match.ext_id}"),
-        ]
-    ])
-
-def kb_duel_start() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Создать дуэль", callback_data="duel:new")],
-    ])
 
 def kb_duel_pick_match(match_id: int, opponent_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -683,7 +806,7 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # In-memory cache for pending sync cards mapping ext_id -> FDMatch
-SYNC_CACHE: Dict[str, FDMatch] = {}
+SYNC_CACHE: Dict[str, dict] = {}
 
 # ------------------------- Commands -------------------------
 
@@ -696,10 +819,54 @@ async def cmd_start(message: Message):
         return await prompt_choose_sport(message, first_time=True)
     await message.answer(f"Привет! Твой спорт: {sport_label(user['sport'], user['league'])}\nВыбирай в меню:", reply_markup=main_kb)
 
+
 @dp.message(Command("sync_today"))
 async def cmd_sync_today(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("⛔ Только админ.")
+
+    # ensure admin user exists in DB (for sport context)
+    u = message.from_user
+    await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
+    admin_user = await adb(_get_user_sync, u.id)
+    sport = (admin_user.get("sport") or "football") if admin_user else "football"
+    league = (admin_user.get("league") or None) if admin_user else None
+
+    if sport == "hockey" and (league or "").upper() == "NHL":
+        await message.answer("🔄 Тяну матчи NHL на сегодня…")
+        try:
+            games = await nhl_today_matches()
+        except Exception as e:
+            logger.exception("sync_today nhl failed")
+            return await message.answer(f"Ошибка при получении матчей NHL: {e}")
+
+        now = utcnow()
+        shown = 0
+        for g in games:
+            if g.kickoff_utc <= now + timedelta(seconds=PREDICTION_CLOSE_SECONDS):
+                continue
+            cache_key = f"nhl:{g.game_id}"
+            SYNC_CACHE[cache_key] = {
+                "ext_id": cache_key,
+                "sport": "hockey",
+                "league": "NHL",
+                "competition": "NHL",
+                "home": g.home,
+                "away": g.away,
+                "kickoff_utc": g.kickoff_utc,
+            }
+            text = (f"🏒 <b>NHL</b>\n"
+                    f"📌 <b>{g.home} — {g.away}</b>\n"
+                    f"🕒 {fmt_kickoff_local(g.kickoff_utc)}")
+            await message.answer(text, reply_markup=kb_admin_sync(cache_key))
+            shown += 1
+            if shown >= 25:
+                break
+        if shown == 0:
+            return await message.answer("На сегодня подходящих матчей NHL нет.")
+        return
+
+    # default: football-data
     await message.answer("🔄 Тяну матчи на сегодня из football-data…")
     try:
         matches = await fd_today_matches()
@@ -710,42 +877,27 @@ async def cmd_sync_today(message: Message):
     now = utcnow()
     shown = 0
     for m in matches:
-        # skip already started or too soon (within close window)
         if m.kickoff_utc <= now + timedelta(seconds=PREDICTION_CLOSE_SECONDS):
             continue
-        SYNC_CACHE[m.ext_id] = m
+        cache_key = f"fd:{m.ext_id}"
+        SYNC_CACHE[cache_key] = {
+            "ext_id": m.ext_id,  # raw id for football-data API
+            "sport": "football",
+            "league": None,
+            "competition": m.competition,
+            "home": m.home,
+            "away": m.away,
+            "kickoff_utc": m.kickoff_utc,
+        }
         text = (f"📌 <b>{m.home} — {m.away}</b>\n"
-                f"🏟 {m.competition}\n"
-                f"🕒 {m.kickoff_utc.astimezone(ZoneInfo(AUTO_SYNC_TZ)).strftime('%d %b %H:%M')} ({AUTO_SYNC_TZ})\n"
-                f"ID: <code>{m.ext_id}</code>")
-        await message.answer(text, reply_markup=kb_admin_sync(m))
+                f"🏁 {m.competition}\n"
+                f"🕒 {fmt_kickoff_local(m.kickoff_utc)}")
+        await message.answer(text, reply_markup=kb_admin_sync(cache_key))
         shown += 1
-
+        if shown >= 25:
+            break
     if shown == 0:
-        await message.answer("На сегодня нет подходящих матчей (либо уже начались/слишком скоро).")
-
-@dp.message(Command("help"))
-@dp.message(F.text == "❓ Помощь")
-async def help_msg(message: Message):
-    await message.answer(
-        "Как играть:\n"
-        "• ⚽ <b>Активные матчи</b> → выбери матч → сделай прогноз (1/X/2)\n"
-        f"• Прогнозы закрываются за <b>{PREDICTION_CLOSE_SECONDS}</b> сек до матча\n"
-        "• После завершения матча бот сам подводит итоги и начисляет очки\n\n"
-        "⚔️ Дуэли:\n"
-        "• Создай дуэль, выбери соперника, матч и ставку 🪙\n"
-        "• Победитель забирает банк, при ничьей — возврат\n"
-    )
-
-# ------------------------- Menu buttons -------------------------
-
-
-@dp.message(F.text == "🏟 Выбрать спорт")
-async def choose_sport_menu(message: Message):
-    u = message.from_user
-    await adb(_upsert_user_sync, u.id, u.username or "", u.first_name or "")
-    await prompt_choose_sport(message, first_time=False)
-
+        await message.answer("На сегодня подходящих футбольных матчей нет.")
 @dp.callback_query(F.data == "sport_back")
 async def sport_back(cb: CallbackQuery):
     await prompt_choose_sport(cb, first_time=False)
@@ -784,15 +936,17 @@ async def pick_league(cb: CallbackQuery):
     await cb.message.answer("Меню доступно ниже 👇", reply_markup=main_kb)
     await cb.answer()
 
+
 @dp.message(F.text == "⚽ Активные матчи")
 async def active_matches(message: Message):
     user = await require_football_or_notice(message)
     if not user:
         return
-    rows = await adb(_list_active_matches_sync)
+    rows = await adb(_list_active_matches_by_sport_sync, user["sport"], user.get("league"))
     if not rows:
         return await message.answer("Сегодня активных матчей нет.", reply_markup=main_kb)
     for r in rows:
+
         m = await adb(_get_match_sync, int(r["match_id"]))
         if not m:
             continue
@@ -856,7 +1010,7 @@ async def my_preds(message: Message):
     user = await require_football_or_notice(message)
     if not user:
         return
-    rows = await adb(_user_predictions_sync, message.from_user.id, 20)
+    rows = await adb(_user_predictions_sync, message.from_user.id, user['sport'], user.get('league'), 20)
     if not rows:
         return await message.answer("У тебя пока нет прогнозов.")
     lines = ["🧾 <b>Твои прогнозы (последние 20)</b>\n"]
@@ -907,7 +1061,7 @@ async def cb_pred(query: CallbackQuery):
         return await query.answer("Прогнозы закрыты", show_alert=True)
     await query.message.edit_text(
         f"Выбери исход для матча:\n<b>{m['home']} — {m['away']}</b>",
-        reply_markup=kb_pred_choices(match_id),
+        reply_markup=kb_pred_choices(match_id, allow_draw=not ((m['sport'] or 'football')=='hockey' and (m['league'] or '').upper()=='NHL')),
     )
     await query.answer()
 
@@ -949,36 +1103,38 @@ async def cb_votes(query: CallbackQuery):
 
 # ------------------------- Callbacks: admin sync -------------------------
 
+
 @dp.callback_query(F.data.startswith("admin_add:"))
 async def cb_admin_add(query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("⛔", show_alert=True)
-    ext_id = query.data.split(":")[1]
-    m = SYNC_CACHE.get(ext_id)
+    cache_key = query.data.split(":")[1]
+    m = SYNC_CACHE.get(cache_key)
     if not m:
         return await query.answer("Кэш пуст", show_alert=True)
-    await adb(_insert_match_sync, m.ext_id, m.competition, m.home, m.away, iso_utc(m.kickoff_utc))
+
+    await adb(
+        _insert_match_sync,
+        m["ext_id"],
+        m.get("sport") or "football",
+        m.get("league"),
+        m.get("competition") or "UNK",
+        m.get("home") or "Home",
+        m.get("away") or "Away",
+        iso_utc(m["kickoff_utc"]),
+    )
     await query.answer("✅ Добавлено", show_alert=True)
     await query.message.edit_reply_markup(reply_markup=None)
+
 
 @dp.callback_query(F.data.startswith("admin_skip:"))
 async def cb_admin_skip(query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("⛔", show_alert=True)
-    await query.answer("Ок")
+    cache_key = query.data.split(":")[1]
+    SYNC_CACHE.pop(cache_key, None)
+    await query.answer("❌ Пропущено", show_alert=True)
     await query.message.edit_reply_markup(reply_markup=None)
-
-# ------------------------- Duels flow -------------------------
-
-# Duel creation is a simple flow:
-# 1) user taps "Создать дуэль" -> ask @username
-# 2) user sends @username -> show open matches list (choose)
-# 3) choose outcome + stake -> create pending duel, reserve challenger stake
-# 4) bot sends opponent DM to accept/decline
-# 5) opponent accepts -> choose outcome -> reserve opponent stake -> duel active
-# 6) on match finish -> resolve duel and pay out/refund
-
-PENDING_OPPONENT: Dict[int, int] = {}  # creator_id -> opponent_id
 
 @dp.callback_query(F.data == "duel:new")
 async def cb_duel_new(query: CallbackQuery):
@@ -1183,6 +1339,7 @@ async def loop_auto_close():
             logger.exception("auto_close loop error")
         await asyncio.sleep(30)
 
+
 async def loop_auto_finish():
     while True:
         try:
@@ -1190,106 +1347,76 @@ async def loop_auto_finish():
             for m in rows:
                 if not m["ext_id"] or m["status"] == "finished":
                     continue
-                # only check if kickoff passed (or soon)
                 kickoff = parse_utc(m["kickoff_utc"])
                 if utcnow() < kickoff - timedelta(minutes=5):
                     continue
-                try:
-                    data = await fd_match_status(str(m["ext_id"]))
-                except Exception:
-                    continue
-                status = (data.get("status") or "").upper()
-                if status != "FINISHED":
-                    continue
 
-                score = (data.get("score") or {}).get("fullTime") or {}
-                hs = score.get("home") if "home" in score else score.get("homeTeam")
-                as_ = score.get("away") if "away" in score else score.get("awayTeam")
+                sport = (m.get("sport") or "football")
+                league = (m.get("league") or "")
+
+                if sport == "hockey" and league.upper() == "NHL":
+                    gid = str(m["ext_id"]).split("nhl:")[-1] if str(m["ext_id"]).startswith("nhl:") else str(m["ext_id"])
+                    g = await nhl_game_status(gid, kickoff)
+                    if not g or not nhl_is_finished(g):
+                        continue
+                    hs, as_ = nhl_scores(g)
+                else:
+                    # football-data
+                    data = await fd_match_status(str(m["ext_id"]))
+                    status = (data.get("status") or "").upper()
+                    if status != "FINISHED":
+                        continue
+                    score = (data.get("score") or {}).get("fullTime") or {}
+                    hs = score.get("home") if "home" in score else score.get("homeTeam")
+                    as_ = score.get("away") if "away" in score else score.get("awayTeam")
+
                 if hs is None or as_ is None:
                     continue
-                hs = int(hs); as_ = int(as_)
-                result = outcome_from_score(hs, as_)
-                match_id = int(m["match_id"])
 
-                # set match finished
-                await adb(_set_match_result_sync, match_id, result, hs, as_)
+                result = outcome_from_scores(int(hs), int(as_))
 
-                # scoring users
-                preds = await adb(_get_predictions_for_match_sync, match_id)
+                await adb(_set_match_result_sync, int(m["match_id"]), result, int(hs), int(as_))
+
+                # scoring + notify
+                preds = await adb(_get_predictions_for_match_sync, int(m["match_id"]))
+                correct_users = []
                 for p in preds:
-                    uid = int(p["user_id"])
-                    ok = (p["outcome"] == result)
-                    await adb(_increment_user_stats_sync, uid, ok)
-                    # notify user
+                    if p["outcome"] == result:
+                        await adb(_increment_user_stats_sync, int(p["user_id"]), 1, 1)
+                        correct_users.append(int(p["user_id"]))
+                    else:
+                        await adb(_increment_user_stats_sync, int(p["user_id"]), 0, 1)
+
+                # resolve duels for this match
+                duels = await adb(_list_unresolved_duels_for_match_sync, int(m["match_id"]))
+                for d in duels:
+                    # duel winner if picked correct outcome
+                    winner = None
+                    if d["p1_outcome"] == result and d["p2_outcome"] != result:
+                        winner = d["p1_id"]
+                    elif d["p2_outcome"] == result and d["p1_outcome"] != result:
+                        winner = d["p2_id"]
+                    elif d["p1_outcome"] == result and d["p2_outcome"] == result:
+                        winner = 0  # draw
+                    else:
+                        winner = None  # no one
+                    await adb(_finish_duel_sync, int(d["duel_id"]), winner, result)
+
+                # broadcast result to participants
+                for p in preds:
                     try:
                         await bot.send_message(
-                            uid,
-                            f"🏁 Матч завершён: <b>{m['home']} — {m['away']}</b>\n"
-                            f"Счёт: <b>{hs}:{as_}</b> | итог: <b>{result}</b>\n"
-                            f"Твой прогноз: <b>{p['outcome']}</b> {'✅' if ok else '❌'}\n"
-                            f"{'+1 очко' if ok else '+0 очков'}"
+                            int(p["user_id"]),
+                            f"✅ Матч завершён: {m['home']} — {m['away']}\n"
+                            f"Счёт: {hs}:{as_}  Итог: <b>{result}</b>",
+                            disable_web_page_preview=True,
                         )
                     except Exception:
                         pass
-
-                # resolve duels
-                duels = await adb(_list_unresolved_duels_for_match_sync, match_id)
-                for d in duels:
-                    duel_id = int(d["duel_id"])
-                    stake = int(d["stake"])
-                    ch = int(d["challenger_id"])
-                    op = int(d["opponent_id"])
-                    status_d = d["status"]
-                    if status_d == "pending":
-                        # opponent never answered -> decline + refund challenger
-                        await adb(_set_duel_status_sync, duel_id, "declined")
-                        await adb(_add_balance_sync, ch, stake)
-                        try:
-                            await bot.send_message(ch, "⚔️ Дуэль отменена (соперник не ответил). Ставка возвращена.")
-                        except Exception:
-                            pass
-                        continue
-                    if status_d != "active":
-                        continue
-                    ch_ok = (d["challenger_outcome"] == result)
-                    op_ok = (d["opponent_outcome"] == result)
-                    winner = None
-                    if ch_ok and not op_ok:
-                        winner = ch
-                    elif op_ok and not ch_ok:
-                        winner = op
-
-                    if winner is None:
-                        # refund both
-                        await adb(_add_balance_sync, ch, stake)
-                        await adb(_add_balance_sync, op, stake)
-                        await adb(_finish_duel_sync, duel_id, None)
-                        msg = f"⚔️ Дуэль завершилась ничьей. Ставки возвращены.\nМатч {m['home']}—{m['away']} итог {result}."
-                        for uid in (ch, op):
-                            try:
-                                await bot.send_message(uid, msg)
-                            except Exception:
-                                pass
-                    else:
-                        # payout winner
-                        pot = stake * 2
-                        await adb(_add_balance_sync, winner, pot)
-                        await adb(_finish_duel_sync, duel_id, winner)
-                        msg_w = f"🏆 Ты выиграл дуэль! +{pot} 🪙\nМатч {m['home']}—{m['away']} итог {result}."
-                        msg_l = f"😬 Ты проиграл дуэль. -{stake} 🪙\nМатч {m['home']}—{m['away']} итог {result}."
-                        try:
-                            await bot.send_message(winner, msg_w)
-                        except Exception:
-                            pass
-                        loser = op if winner == ch else ch
-                        try:
-                            await bot.send_message(loser, msg_l)
-                        except Exception:
-                            pass
-
         except Exception:
             logger.exception("auto_finish loop error")
         await asyncio.sleep(60)
+
 
 async def loop_auto_sync():
     if not AUTO_SYNC_ENABLED:
