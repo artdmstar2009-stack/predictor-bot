@@ -202,21 +202,7 @@ def _init_db_sync():
     """)
 
 
-# --- migrations for multisport ---
-try:
-    cur.execute("PRAGMA table_info(matches)")
-    cols = {row[1] for row in cur.fetchall()}
-    if "sport" not in cols:
-        cur.execute("ALTER TABLE matches ADD COLUMN sport TEXT DEFAULT 'football'")
-    if "league" not in cols:
-        cur.execute("ALTER TABLE matches ADD COLUMN league TEXT")
-    # backfill for old rows
-    cur.execute("UPDATE matches SET sport=COALESCE(sport,'football') WHERE sport IS NULL OR sport=''")
-except Exception:
-    pass
 
-    con.commit()
-    con.close()
 
 async def adb(func, *args, timeout: int = 15):
     return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout)
