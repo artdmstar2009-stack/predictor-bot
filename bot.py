@@ -27,6 +27,7 @@ import aiohttp
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
@@ -592,7 +593,7 @@ def kb_duel_pick_outcome(duel_id: int) -> InlineKeyboardMarkup:
 
 # ------------------------- Bot setup -------------------------
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # In-memory cache for pending sync cards mapping ext_id -> FDMatch
