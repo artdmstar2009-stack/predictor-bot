@@ -891,7 +891,7 @@ async def find_player_cmd(message: Message):
     set_state(message.from_user.id, None)
     await send_profile(message, uid)
 
-@dp.message()
+@dp.message(F.text.startswith('@'))
 async def state_router(message: Message):
     st = get_state(message.from_user.id)
     if st != "await_find_username":
