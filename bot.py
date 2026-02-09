@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import asyncio
 import logging
 import os
@@ -710,7 +712,7 @@ def main_menu_kb(user_is_admin: bool):
 def matches_list_kb(matches, user_is_admin: bool):
     kb = ReplyKeyboardBuilder()
     for r in matches[:50]:
-        kb.button(text=f"🏟 #{r['id']}")
+        kb.button(text=f"[MATCH] #{r['id']}")
     kb.button(text=BTN_BACK)
     if user_is_admin:
         kb.button(text=BTN_NEW)
@@ -730,7 +732,7 @@ def combined_menu_kb(matches, user_is_admin: bool):
         kb.button(text=BTN_NEW)
     # Matches (below)
     for r in matches[:50]:
-        kb.button(text=f"🏟 #{r['id']}")
+        kb.button(text=f"[MATCH] #{r['id']}")
     # Layout: first rows in 2 columns, then one match per row
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup(resize_keyboard=True)
@@ -763,7 +765,7 @@ def profile_kb(viewer_id: int, target_id: int):
 # ===================== Parsing helpers =====================
 def parse_match_button(text: str) -> Optional[int]:
     text = (text or "").strip()
-    if not text.startswith("🏟 #"):
+    if not text.startswith("[MATCH] #"):
         return None
     try:
         after_hash = text.split("#", 1)[1]
@@ -997,8 +999,8 @@ async def active_matches(message: Message):
     if not matches:
         await message.answer("Нет активных матчей.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
         return
-    matches_text = "📋 Активные матчи:\n\n" + "\n".join(lines)
-".join([f"🏟 #{r['id']} {r['title']}" for r in matches[:40]])
+    matches_text = "
+".join([f"[MATCH] #{r['id']} {r['title']}" for r in matches[:40]])
     if len(matches) > 40:
         matches_text += f"
 …и ещё {len(matches)-40} матч(ей)."
@@ -1010,7 +1012,7 @@ async def active_matches(message: Message):
 (нажми «⚽ Активные матчи», чтобы обновить список)",
         reply_markup=combined_menu_kb(matches, is_admin(message.from_user.id))
     )
-@dp.message(F.text.startswith("🏟 #"))
+@dp.message(F.text.startswith("[MATCH] #"))
 async def picked_match(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
     set_state(message.from_user.id, None)
@@ -1378,4 +1380,3 @@ async def main():
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
-
