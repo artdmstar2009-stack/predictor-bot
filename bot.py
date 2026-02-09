@@ -999,14 +999,17 @@ async def active_matches(message: Message):
     if not matches:
         await message.answer("Нет активных матчей.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
         return
-    matches_text = "
-".join([f"[MATCH] #{r['id']} {r['title']}" for r in matches[:40]])
-    if len(matches) > 40:
-        matches_text += f"
-…и ещё {len(matches)-40} матч(ей)."
-    await message.answer(
-        "Активные матчи:
-" + matches_text + "
+    # безопасный список матчей (без эмодзи и без битых переносов)
+lines = []
+for r in matches[:40]:
+    mid = r["id"] if isinstance(r, dict) else r[0]
+    title = r["title"] if isinstance(r, dict) else r[1]
+    lines.append(f"[MATCH] #{mid} {title}")
+
+if not lines:
+    matches_text = "Активных матчей сейчас нет."
+else:
+    matches_text = "Активные матчи:\n\n" + "\n".join(lines)
 
 Выбери матч в меню ниже 👇
 (нажми «⚽ Активные матчи», чтобы обновить список)",
@@ -1380,3 +1383,4 @@ async def main():
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
+
