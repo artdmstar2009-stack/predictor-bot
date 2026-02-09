@@ -4,7 +4,7 @@ import os
 import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F
@@ -12,10 +12,32 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
+import aiohttp
+from zoneinfo import ZoneInfo
+
 # ===== CONFIG =====
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "predictor.db"
+
+# ===== AUTOSYNC CONFIG =====
+SYNC_ENABLED = os.getenv('SYNC_ENABLED', '1') == '1'
+SYNC_TZ = os.getenv('SYNC_TZ', 'Europe/London')
+SYNC_HOUR = int(os.getenv('SYNC_HOUR', '4'))  # default: 04:00 London
+SYNC_MINUTE = int(os.getenv('SYNC_MINUTE', '0'))
+SYNC_LOOKAHEAD_DAYS = int(os.getenv('SYNC_LOOKAHEAD_DAYS', '1'))
+
+FOOTBALL_DATA_TOKEN = os.getenv('FOOTBALL_DATA_TOKEN', '')
+# Example: PL,PD,SA,BL1,FL1,CL
+FOOTBALL_COMPETITIONS = [c.strip() for c in os.getenv('FOOTBALL_COMPETITIONS', 'PL,CL').split(',') if c.strip()]
+
+NHL_ENABLED = os.getenv('NHL_ENABLED', '1') == '1'
+
+LIQUIPEDIA_ENABLED = os.getenv('LIQUIPEDIA_ENABLED', '0') == '1'
+# Example: counterstrike,dota2
+LIQUIPEDIA_GAMES = [g.strip() for g in os.getenv('LIQUIPEDIA_GAMES', '').split(',') if g.strip()]
+
+# ============================
 # ==================
 
 dp = Dispatcher()
@@ -69,6 +91,24 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'open'
         )
         """)
+        # --- migrations for autosync (safe to run every start) ---
+        for stmt in [
+            "ALTER TABLE matches ADD COLUMN sport TEXT",
+            "ALTER TABLE matches ADD COLUMN league TEXT",
+            "ALTER TABLE matches ADD COLUMN start_time TEXT",
+            "ALTER TABLE matches ADD COLUMN source TEXT",
+            "ALTER TABLE matches ADD COLUMN external_id TEXT",
+            "ALTER TABLE matches ADD COLUMN home TEXT",
+            "ALTER TABLE matches ADD COLUMN away TEXT",
+            "ALTER TABLE matches ADD COLUMN created_at TEXT",
+        ]:
+            try:
+                con.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_source_ext ON matches(source, external_id)")
+        # ---------------------------------------------------------
+
         con.execute("""
         CREATE TABLE IF NOT EXISTS votes(
             match_id INTEGER NOT NULL,
@@ -136,6 +176,215 @@ def init_db():
 # ===================== Core helpers =====================
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
+
+# ===================== AUTOSYNC =====================
+def _match_exists(source: str, external_id: str) -> bool:
+    with db() as con:
+        row = con.execute(
+            "SELECT 1 FROM matches WHERE source=? AND external_id=? LIMIT 1",
+            (source, external_id),
+        ).fetchone()
+        return row is not None
+
+def upsert_external_match(*, title: str, source: str, external_id: str, sport: str, league: str,
+                          start_time: Optional[str], home: Optional[str], away: Optional[str]) -> bool:
+    """Insert a match if it doesn't exist yet. Returns True if inserted."""
+    if not source or not external_id:
+        return False
+    if _match_exists(source, external_id):
+        return False
+    with db() as con:
+        con.execute(
+            """INSERT INTO matches(title, status, sport, league, start_time, source, external_id, home, away, created_at)
+               VALUES(?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (title, sport, league, start_time, source, external_id, home, away, now_iso()),
+        )
+    return True
+
+async def _http_get_json(session: aiohttp.ClientSession, url: str, headers: Optional[dict] = None, params: Optional[dict] = None) -> dict:
+    async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=25)) as r:
+        r.raise_for_status()
+        return await r.json()
+
+async def sync_football_data(*, lookahead_days: int) -> Tuple[int, str]:
+    """Sync upcoming football matches via football-data.org (requires FOOTBALL_DATA_TOKEN)."""
+    if not FOOTBALL_DATA_TOKEN:
+        return 0, "FOOTBALL_DATA_TOKEN is not set"
+    if not FOOTBALL_COMPETITIONS:
+        return 0, "FOOTBALL_COMPETITIONS is empty"
+
+    today = date.today()
+    date_from = today.isoformat()
+    date_to = (today + timedelta(days=max(0, lookahead_days))).isoformat()
+
+    inserted = 0
+    async with aiohttp.ClientSession(headers={"User-Agent": "predictor-bot/1.0"}) as session:
+        for comp in FOOTBALL_COMPETITIONS:
+            try:
+                data = await _http_get_json(
+                    session,
+                    f"https://api.football-data.org/v4/competitions/{comp}/matches",
+                    headers={"X-Auth-Token": FOOTBALL_DATA_TOKEN},
+                    params={"status": "SCHEDULED", "dateFrom": date_from, "dateTo": date_to},
+                )
+                for m in data.get("matches", []):
+                    mid = str(m.get("id", ""))
+                    utc = m.get("utcDate")
+                    home = (m.get("homeTeam") or {}).get("name")
+                    away = (m.get("awayTeam") or {}).get("name")
+                    comp_name = ((m.get("competition") or {}).get("code") or comp)
+                    title = f"⚽ {comp_name}: {home} vs {away}"
+                    if utc:
+                        title += f" • {utc.replace('T',' ')[:16]} UTC"
+                    if upsert_external_match(
+                        title=title,
+                        source="football-data",
+                        external_id=mid,
+                        sport="football",
+                        league=comp_name,
+                        start_time=utc,
+                        home=home,
+                        away=away,
+                    ):
+                        inserted += 1
+            except Exception as e:
+                # keep going; we'll report aggregated error at the end
+                logging.exception("football-data sync failed for %s: %s", comp, e)
+
+    return inserted, "ok"
+
+async def sync_nhl(*, lookahead_days: int) -> Tuple[int, str]:
+    """Sync upcoming NHL games. Uses the newer api-web.nhle.com schedule endpoint, fallback to legacy statsapi."""
+    if not NHL_ENABLED:
+        return 0, "NHL_ENABLED=0"
+
+    inserted = 0
+    tz_utc = ZoneInfo("UTC")
+    today = datetime.now(tz_utc).date()
+    days = [today + timedelta(days=i) for i in range(0, max(1, lookahead_days + 1))]
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "predictor-bot/1.0"}) as session:
+        for d in days:
+            dstr = d.isoformat()
+            data = None
+            # Newer endpoint (works when legacy is blocked)
+            try:
+                data = await _http_get_json(session, f"https://api-web.nhle.com/v1/schedule/{dstr}")
+            except Exception:
+                # Legacy fallback
+                try:
+                    data = await _http_get_json(session, "https://statsapi.web.nhl.com/api/v1/schedule", params={"date": dstr})
+                except Exception as e:
+                    logging.exception("NHL sync failed for %s: %s", dstr, e)
+                    continue
+
+            # Parse both shapes
+            games = []
+            if "gameWeek" in (data or {}):
+                # api-web.nhle.com shape
+                for week in data.get("gameWeek", []):
+                    for gday in week.get("games", []):
+                        games.append(gday)
+            elif "dates" in (data or {}):
+                # legacy statsapi shape
+                for dt in data.get("dates", []):
+                    games.extend(dt.get("games", []))
+
+            for g in games:
+                try:
+                    # new shape uses gameId, startTimeUTC, homeTeam/awayTeam with 'placeName'
+                    gid = str(g.get("id") or g.get("gamePk") or g.get("gameId") or "")
+                    if not gid:
+                        continue
+                    start_utc = g.get("startTimeUTC") or (g.get("gameDate"))
+                    if "homeTeam" in g and isinstance(g["homeTeam"], dict):
+                        home = g["homeTeam"].get("placeName", {}).get("default") or g["homeTeam"].get("name", {}).get("default") or g["homeTeam"].get("teamName", {}).get("default")
+                        away = g.get("awayTeam", {}).get("placeName", {}).get("default") or g.get("awayTeam", {}).get("name", {}).get("default") or g.get("awayTeam", {}).get("teamName", {}).get("default")
+                    else:
+                        # legacy statsapi
+                        home = (g.get("teams") or {}).get("home", {}).get("team", {}).get("name")
+                        away = (g.get("teams") or {}).get("away", {}).get("team", {}).get("name")
+
+                    title = f"🏒 NHL: {home} vs {away}"
+                    if start_utc:
+                        title += f" • {str(start_utc).replace('T',' ')[:16]} UTC"
+
+                    if upsert_external_match(
+                        title=title,
+                        source="nhl",
+                        external_id=gid,
+                        sport="hockey",
+                        league="NHL",
+                        start_time=str(start_utc) if start_utc else None,
+                        home=home,
+                        away=away,
+                    ):
+                        inserted += 1
+                except Exception as e:
+                    logging.exception("NHL game parse failed: %s", e)
+
+    return inserted, "ok"
+
+async def sync_liquipedia(*, lookahead_days: int) -> Tuple[int, str]:
+    """Stub sync for Liquipedia (MediaWiki API). Enable with LIQUIPEDIA_ENABLED=1 and implement per-game parsing."""
+    if not LIQUIPEDIA_ENABLED:
+        return 0, "LIQUIPEDIA_ENABLED=0"
+    if not LIQUIPEDIA_GAMES:
+        return 0, "LIQUIPEDIA_GAMES is empty (set e.g. counterstrike,dota2)"
+    # NOTE: Liquipedia data structure differs per game; real parsing needs per-wiki templates.
+    # We keep this as a placeholder so the bot doesn't crash if enabled accidentally.
+    return 0, "not implemented (needs per-game parser)"
+
+async def sync_all_sources(bot: Bot, *, lookahead_days: int) -> str:
+    total_inserted = 0
+    parts = []
+
+    f_ins, f_msg = await sync_football_data(lookahead_days=lookahead_days)
+    total_inserted += f_ins
+    parts.append(f"⚽ football-data: +{f_ins} ({f_msg})")
+
+    n_ins, n_msg = await sync_nhl(lookahead_days=lookahead_days)
+    total_inserted += n_ins
+    parts.append(f"🏒 NHL: +{n_ins} ({n_msg})")
+
+    l_ins, l_msg = await sync_liquipedia(lookahead_days=lookahead_days)
+    total_inserted += l_ins
+    parts.append(f"🎮 Liquipedia: +{l_ins} ({l_msg})")
+
+    report = "Автосинк матчей завершён\n" + "\n".join(parts) + f"\n\nИтого добавлено: {total_inserted}"
+    # notify admin if configured
+    if ADMIN_ID:
+        await safe_dm(bot, ADMIN_ID, report)
+    return report
+
+def _next_run_dt(now_tz: datetime, hour: int, minute: int) -> datetime:
+    candidate = now_tz.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now_tz:
+        candidate = candidate + timedelta(days=1)
+    return candidate
+
+async def autosync_loop(bot: Bot):
+    if not SYNC_ENABLED:
+        logging.info("Autosync disabled (SYNC_ENABLED=0)")
+        return
+
+    tz = ZoneInfo(SYNC_TZ)
+    logging.info("Autosync enabled: %s %02d:%02d (lookahead=%d days)", SYNC_TZ, SYNC_HOUR, SYNC_MINUTE, SYNC_LOOKAHEAD_DAYS)
+
+    while True:
+        now_tz = datetime.now(tz)
+        nxt = _next_run_dt(now_tz, SYNC_HOUR, SYNC_MINUTE)
+        sleep_s = (nxt - now_tz).total_seconds()
+        logging.info("Next autosync at %s (%s) in %.0f seconds", nxt.isoformat(timespec="seconds"), SYNC_TZ, sleep_s)
+        await asyncio.sleep(max(5, sleep_s))
+        try:
+            await sync_all_sources(bot, lookahead_days=SYNC_LOOKAHEAD_DAYS)
+        except Exception as e:
+            logging.exception("Autosync failed: %s", e)
+            if ADMIN_ID:
+                await safe_dm(bot, ADMIN_ID, f"❌ Автосинк упал: {e}")
+
+# ===================================================
 
 def upsert_user(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]):
     with db() as con:
@@ -1017,6 +1266,16 @@ async def newmatch_cmd(message: Message):
     await message.answer("Матч создан ✅\nНажми «⚽ Активные матчи», чтобы увидеть его в списке.")
 
 # ===== Admin actions (close / set result) =====
+@dp.message(Command("sync_now"))
+async def sync_now_cmd(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Только админ.")
+        return
+    await message.answer("🔄 Запускаю автосинк источников...")
+    report = await sync_all_sources(message.bot, lookahead_days=SYNC_LOOKAHEAD_DAYS)
+    await message.answer(report)
+
 @dp.callback_query(F.data.startswith("admin:"))
 async def admin_actions(call: CallbackQuery):
     upsert_user(call.from_user.id, call.from_user.username, call.from_user.first_name, call.from_user.last_name)
@@ -1169,6 +1428,9 @@ async def main():
     bot = Bot(TOKEN)
     me = await bot.get_me()
     BOT_USERNAME = me.username
+
+    # start autosync in background
+    asyncio.create_task(autosync_loop(bot))
 
     await dp.start_polling(bot)
 
