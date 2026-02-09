@@ -33,6 +33,10 @@ LIQUIPEDIA_GAMES = [g.strip() for g in os.getenv('LIQUIPEDIA_GAMES', '').split('
 AUTO_RESULTS_ENABLED = os.getenv('AUTO_RESULTS_ENABLED', '1') == '1'
 AUTO_RESULTS_INTERVAL = int(os.getenv('AUTO_RESULTS_INTERVAL', '300'))  # seconds
 AUTO_RESULTS_MIN_AGE_MINUTES = int(os.getenv('AUTO_RESULTS_MIN_AGE_MINUTES', '30'))  # don't finalize too early
+
+# ===== KEEPALIVE (prevent sleeping on free hosting) =====
+KEEPALIVE_URL = os.getenv('KEEPALIVE_URL', '')
+KEEPALIVE_INTERVAL = int(os.getenv('KEEPALIVE_INTERVAL', '300'))  # seconds
 # ============================
 # ==================
 dp = Dispatcher()
@@ -186,6 +190,23 @@ async def _http_get_json(session: aiohttp.ClientSession, url: str, headers: Opti
     async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=25)) as r:
         r.raise_for_status()
         return await r.json()
+
+async def keepalive_loop():
+    """Optional: periodically GET KEEPALIVE_URL to keep the service warm on some hosts."""
+    if not KEEPALIVE_URL:
+        logging.info("KEEPALIVE_URL not set; keepalive disabled")
+        return
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                async with session.get(KEEPALIVE_URL) as r:
+                    _ = await r.text()
+                logging.info("Keepalive ping OK")
+            except Exception as e:
+                logging.warning(f"Keepalive ping failed: {e}")
+            await asyncio.sleep(max(60, KEEPALIVE_INTERVAL))
+
 async def sync_football_data(*, lookahead_days: int) -> Tuple[int, str]:
     """Sync upcoming football matches via football-data.org (requires FOOTBALL_DATA_TOKEN)."""
     if not FOOTBALL_DATA_TOKEN:
@@ -688,8 +709,8 @@ def main_menu_kb(user_is_admin: bool):
     return kb.as_markup(resize_keyboard=True)
 def matches_list_kb(matches, user_is_admin: bool):
     kb = ReplyKeyboardBuilder()
-    for r in matches:
-        kb.button(text=f"🏟 #{r['id']} {r['title']}")
+    for r in matches[:50]:
+        kb.button(text=f"🏟 #{r['id']}")
     kb.button(text=BTN_BACK)
     if user_is_admin:
         kb.button(text=BTN_NEW)
@@ -708,8 +729,8 @@ def combined_menu_kb(matches, user_is_admin: bool):
     if user_is_admin:
         kb.button(text=BTN_NEW)
     # Matches (below)
-    for r in matches:
-        kb.button(text=f"🏟 #{r['id']} {r['title']}")
+    for r in matches[:50]:
+        kb.button(text=f"🏟 #{r['id']}")
     # Layout: first rows in 2 columns, then one match per row
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup(resize_keyboard=True)
@@ -976,7 +997,19 @@ async def active_matches(message: Message):
     if not matches:
         await message.answer("Нет активных матчей.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
         return
-    await message.answer("Выбери матч в меню ниже 👇\n(нажми «⚽ Активные матчи», чтобы обновить список)", reply_markup=combined_menu_kb(matches, is_admin(message.from_user.id)))
+    matches_text = "
+".join([f"🏟 #{r['id']} {r['title']}" for r in matches[:40]])
+    if len(matches) > 40:
+        matches_text += f"
+…и ещё {len(matches)-40} матч(ей)."
+    await message.answer(
+        "Активные матчи:
+" + matches_text + "
+
+Выбери матч в меню ниже 👇
+(нажми «⚽ Активные матчи», чтобы обновить список)",
+        reply_markup=combined_menu_kb(matches, is_admin(message.from_user.id))
+    )
 @dp.message(F.text.startswith("🏟 #"))
 async def picked_match(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
@@ -1341,6 +1374,7 @@ async def main():
     # start autosync in background
     asyncio.create_task(autosync_loop(bot))
     asyncio.create_task(autoresults_loop(bot))
+    asyncio.create_task(keepalive_loop())
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
