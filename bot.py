@@ -997,7 +997,7 @@ async def active_matches(message: Message):
     if not matches:
         await message.answer("Нет активных матчей.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
         return
-    matches_text = "
+    matches_text = "📋 Активные матчи:\n\n" + "\n".join(lines)
 ".join([f"🏟 #{r['id']} {r['title']}" for r in matches[:40]])
     if len(matches) > 40:
         matches_text += f"
@@ -1378,3 +1378,4 @@ async def main():
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
+
