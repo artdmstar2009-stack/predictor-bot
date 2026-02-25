@@ -20,6 +20,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -106,6 +107,11 @@ def db() -> sqlite3.Connection:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+MOSCOW_TZ = ZoneInfo('Europe/Moscow')
+
+def now_msk() -> datetime:
+    return datetime.now(MOSCOW_TZ)
 
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
@@ -377,50 +383,21 @@ def _day_bounds(day_filter: str) -> Tuple[Optional[str], Optional[str]]:
         base = base + timedelta(days=1)
     return iso(base), iso(base + timedelta(days=1))
 
-def count_open_matches(sport: str, day_filter: str = "all") -> int:
-    start, end = _day_bounds(day_filter)
+def count_open_matches(sport: str) -> int:
     with db() as con:
         if sport == "all":
-            if start and end:
-                r = con.execute("""
-                    SELECT COUNT(*) c FROM matches
-                    WHERE status='open'
-                      AND COALESCE(start_time_utc, start_time) >= ?
-                      AND COALESCE(start_time_utc, start_time) < ?
-                """, (start, end)).fetchone()
-            else:
-                r = con.execute("SELECT COUNT(*) c FROM matches WHERE status='open'").fetchone()
+            r = con.execute("SELECT COUNT(*) c FROM matches WHERE status='open'").fetchone()
         else:
-            if start and end:
-                r = con.execute("""
-                    SELECT COUNT(*) c FROM matches
-                    WHERE status='open'
-                      AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
-                      AND COALESCE(start_time_utc, start_time) >= ?
-                      AND COALESCE(start_time_utc, start_time) < ?
-                """, (sport, start, end)).fetchone()
-            else:
-                r = con.execute("""
-                    SELECT COUNT(*) c FROM matches
-                    WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
-                """, (sport,)).fetchone()
+            r = con.execute("""
+                SELECT COUNT(*) c FROM matches
+                WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
+            """, (sport,)).fetchone()
     return int(r["c"]) if r else 0
 
-def get_open_matches_page(sport: str, page: int, day_filter: str = "all") -> List[sqlite3.Row]:
+def get_open_matches_page(sport: str, page: int) -> List[sqlite3.Row]:
     offset = max(0, page) * PER_PAGE
-    start, end = _day_bounds(day_filter)
     with db() as con:
         if sport == "all":
-            if start and end:
-                return con.execute("""
-                    SELECT id, title, start_time_utc, league, sport, start_time
-                    FROM matches
-                    WHERE status='open'
-                      AND COALESCE(start_time_utc, start_time) >= ?
-                      AND COALESCE(start_time_utc, start_time) < ?
-                    ORDER BY COALESCE(start_time_utc, start_time) ASC
-                    LIMIT ? OFFSET ?
-                """, (start, end, PER_PAGE, offset)).fetchall()
             return con.execute("""
                 SELECT id, title, start_time_utc, league, sport, start_time
                 FROM matches
@@ -428,17 +405,6 @@ def get_open_matches_page(sport: str, page: int, day_filter: str = "all") -> Lis
                 ORDER BY COALESCE(start_time_utc, start_time) ASC
                 LIMIT ? OFFSET ?
             """, (PER_PAGE, offset)).fetchall()
-
-        if start and end:
-            return con.execute("""
-                SELECT id, title, start_time_utc, league, sport, start_time
-                FROM matches
-                WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
-                  AND COALESCE(start_time_utc, start_time) >= ?
-                  AND COALESCE(start_time_utc, start_time) < ?
-                ORDER BY COALESCE(start_time_utc, start_time) ASC
-                LIMIT ? OFFSET ?
-            """, (sport, start, end, PER_PAGE, offset)).fetchall()
 
         return con.execute("""
             SELECT id, title, start_time_utc, league, sport, start_time
@@ -851,7 +817,7 @@ async def cmd_start(m: Message):
     text_msg = (
         "👋 Привет!\n\n"
         "Это бот прогнозов <b>1X2</b>.\n"
-        "Жми <b>⚡ Активные матчи</b> → выбери дату → спорт → матч.\n\n"
+        "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч.\n\n"
         f"⏱ Дедлайн: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта."
     )
     await m.answer(text_msg, reply_markup=main_menu())
@@ -862,7 +828,7 @@ async def help_btn(m: Message):
     upsert_user_from_message(m)
     await m.answer(
         "ℹ️ <b>Помощь</b>\n\n"
-        "• ⚡ Активные матчи → дата → спорт → матч → 1/X/2\n"
+        "• ⚡ Активные матчи → спорт → матч → 1/X/2\n"
         "• 🔎 Найти матч — поиск по команде/части названия\n"
         "• 🔥 Матч дня — быстрый доступ к матчу сегодня\n\n"
         f"Очки за верный исход: <b>+{POINTS_FOR_CORRECT}</b>",
@@ -881,26 +847,13 @@ async def sync_cmd(m: Message):
 @dp.message(F.text == BTN_ACTIVE)
 async def active_matches(m: Message):
     upsert_user_from_message(m)
-    df = get_pref(m.from_user.id, "day_filter", "all")
-    set_pref(m.from_user.id, day_filter=df)
     sports = get_open_sports()
     if not sports:
         await m.answer("Пока нет активных матчей.", reply_markup=main_menu())
         return
-    await m.answer("⚡ <b>Активные матчи</b>\n\nВыбери фильтр по дате 👇", reply_markup=main_menu())
-    await m.answer("Фильтр:", reply_markup=ikb_day_filter(df))
-    await m.answer("Теперь выбери вид спорта 👇", reply_markup=ikb_sports(sports))
+    await m.answer("⚡ <b>Активные матчи</b>\n\nВыбери вид спорта 👇", reply_markup=main_menu())
+    await m.answer("Категории:", reply_markup=ikb_sports(sports))
 
-@dp.callback_query(F.data.startswith("day:"))
-async def cb_day(cb: CallbackQuery):
-    upsert_user_from_message(cb)
-    df = cb.data.split(":", 1)[1].strip().lower() if cb.data else "all"
-    if df not in ("all", "today", "tomorrow"):
-        df = "all"
-    set_pref(cb.from_user.id, day_filter=df)
-    sports = get_open_sports()
-    await cb.message.answer("✅ Фильтр установлен. Выбери спорт:", reply_markup=ikb_sports(sports))
-    await cb.answer()
 
 @dp.callback_query(F.data.startswith("sport:"))
 async def cb_sport(cb: CallbackQuery):
@@ -913,8 +866,7 @@ async def cb_sport(cb: CallbackQuery):
         return
 
     sport = (sport or "all").lower()
-    df = get_pref(cb.from_user.id, "day_filter", "all")
-    total = count_open_matches(sport, df)
+    total = count_open_matches(sport)
     if total <= 0:
         await cb.answer("В этой категории матчей нет.", show_alert=True)
         return
@@ -922,9 +874,8 @@ async def cb_sport(cb: CallbackQuery):
     max_page = max(0, (total - 1) // PER_PAGE)
     page = min(max(page, 0), max_page)
 
-    items = get_open_matches_page(sport, page, df)
+    items = get_open_matches_page(sport, page)
     header = "📋 Все матчи" if sport == "all" else SPORT_PRETTY.get(sport, f"🏟 {sport}")
-    df_label = {"all": "🗂 Все даты", "today": "📅 Сегодня", "tomorrow": "📅 Завтра"}.get(df, "🗂 Все даты")
 
     blocks: List[str] = []
     for r in items:
@@ -939,7 +890,7 @@ async def cb_sport(cb: CallbackQuery):
             blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🔖 {code} • {time_short}\n🕒 {st}")
 
     await cb.message.answer(
-        f"{header}  •  {df_label}\n\n" + "\n\n".join(blocks),
+        f"{header}\n\n" + "\n\n".join(blocks),
         reply_markup=ikb_matches_list(sport, page, items, total),
     )
     await cb.answer()
@@ -952,8 +903,7 @@ async def cb_back_sports(cb: CallbackQuery):
     if not sports:
         await cb.answer("Матчей нет.", show_alert=True)
         return
-    await cb.message.answer("⬅️ Назад. Фильтр по дате:", reply_markup=ikb_day_filter(df))
-    await cb.message.answer("Выбери спорт:", reply_markup=ikb_sports(sports))
+    await cb.message.answer("⬅️ Назад. Выбери спорт:", reply_markup=ikb_sports(sports))
     await cb.answer()
 
 @dp.callback_query(F.data == "noop")
