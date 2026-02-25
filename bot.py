@@ -126,6 +126,24 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ============================================================
+# IN-MEMORY STATE (for simple flows)
+# ============================================================
+
+STATE: Dict[int, Dict[str, Any]] = {}
+
+def set_pref(user_id: int, **data: Any) -> None:
+    cur = STATE.get(user_id, {})
+    cur.update(data)
+    STATE[user_id] = cur
+
+def get_pref(user_id: int, key: str, default: Any = None) -> Any:
+    return STATE.get(user_id, {}).get(key, default)
+
+def clear_pref(user_id: int, key: str) -> None:
+    if user_id in STATE and key in STATE[user_id]:
+        del STATE[user_id][key]
+
+# ============================================================
 # DB + utils
 # ============================================================
 
@@ -263,6 +281,7 @@ BTN_MY = "🧾 Мои прогнозы"
 BTN_LB = "🏆 Лидерборд"
 BTN_PROFILE = "👤 Профиль"
 BTN_HELP = "ℹ️ Помощь"
+BTN_FIND_MATCH = "🔎 Найти матч"
 
 SPORT_PRETTY = {
     "football": "⚽ Футбол",
@@ -296,6 +315,22 @@ def _pretty_time(dt_raw: str) -> str:
     except Exception:
         return dt_raw.replace("T", " ").replace("+00:00", " UTC")
 
+def _abbr_team(name: str) -> str:
+    s = re.sub(r"[^A-Za-zА-Яа-я0-9 ]+", " ", name).strip()
+    if not s:
+        return "---"
+    parts = [p for p in s.split() if p]
+    base = (parts[0] if parts else s)[:3]
+    return base.upper()
+
+def _short_code(title: str) -> str:
+    t = re.sub(r"\s+vs\.?\s+", " 🆚 ", (title or ""), flags=re.I)
+    t = re.sub(r"\s+-\s+", " 🆚 ", t)
+    if "🆚" in t:
+        a, b = [p.strip() for p in t.split("🆚", 1)]
+        return f"{_abbr_team(a)}-{_abbr_team(b)}"
+    return _abbr_team(t)
+
 def _pretty_title(title: str, sport: str) -> str:
     t = (title or "").strip()
     t = re.sub(r"\s+vs\.?\s+", " 🆚 ", t, flags=re.I)
@@ -306,13 +341,25 @@ def _pretty_title(title: str, sport: str) -> str:
             t = f"{a.upper()} 🆚 {b.upper()}"
     return f"{_sport_emoji(sport)} {t}"
 
+def ikb_day_filter(current: str = 'all') -> InlineKeyboardMarkup:
+    cur = (current or 'all').lower()
+    def mark(lbl: str, key: str) -> str:
+        return f"✅ {lbl}" if cur == key else lbl
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=mark('📅 Сегодня', 'today'), callback_data='day:today'),
+        InlineKeyboardButton(text=mark('📅 Завтра', 'tomorrow'), callback_data='day:tomorrow'),
+        InlineKeyboardButton(text=mark('🗂 Все даты', 'all'), callback_data='day:all'),
+    ]])
+
 def main_menu() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=BTN_ACTIVE), KeyboardButton(text=BTN_TODAY)],
-        [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_LB)],
-        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_FIND_MATCH), KeyboardButton(text=BTN_MY)],
+        [KeyboardButton(text=BTN_LB), KeyboardButton(text=BTN_PROFILE)],
+        [KeyboardButton(text=BTN_HELP)],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+(keyboard=rows, resize_keyboard=True)
 
 def ikb_sports(sports: List[Tuple[str, int]]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
@@ -370,21 +417,64 @@ def get_open_sports() -> List[Tuple[str, int]]:
         """).fetchall()
     return [(r["sport"], int(r["c"])) for r in rows]
 
-def count_open_matches(sport: str) -> int:
+def count_open_matches(sport: str, day_filter: str = 'all') -> int:
     with db() as con:
+        df = (day_filter or 'all').lower()
+        start = end = None
+        if df in ('today','tomorrow'):
+            base = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+            if df == 'tomorrow':
+                base = base + timedelta(days=1)
+            start = iso(base)
+            end = iso(base + timedelta(days=1))
         if sport == "all":
-            r = con.execute("SELECT COUNT(*) c FROM matches WHERE status='open'").fetchone()
+            if start and end:
+                r = con.execute("""
+                    SELECT COUNT(*) c FROM matches
+                    WHERE status='open'
+                      AND COALESCE(start_time_utc, start_time) >= ?
+                      AND COALESCE(start_time_utc, start_time) < ?
+                """, (start, end)).fetchone()
+            else:
+                r = con.execute("SELECT COUNT(*) c FROM matches WHERE status='open'").fetchone()
         else:
-            r = con.execute("""
-                SELECT COUNT(*) c FROM matches
-                WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
-            """, (sport,)).fetchone()
+            if start and end:
+                r = con.execute("""
+                    SELECT COUNT(*) c FROM matches
+                    WHERE status='open'
+                      AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
+                      AND COALESCE(start_time_utc, start_time) >= ?
+                      AND COALESCE(start_time_utc, start_time) < ?
+                """, (sport, start, end)).fetchone()
+            else:
+                r = con.execute("""
+                    SELECT COUNT(*) c FROM matches
+                    WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
+                """, (sport,)).fetchone()
     return int(r["c"]) if r else 0
 
-def get_open_matches_page(sport: str, page: int) -> List[sqlite3.Row]:
+def get_open_matches_page(sport: str, page: int, day_filter: str = 'all') -> List[sqlite3.Row]:
     offset = max(0, page) * PER_PAGE
+    df = (day_filter or 'all').lower()
+    start = end = None
+    if df in ('today','tomorrow'):
+        base = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+        if df == 'tomorrow':
+            base = base + timedelta(days=1)
+        start = iso(base)
+        end = iso(base + timedelta(days=1))
     with db() as con:
         if sport == "all":
+            if start and end:
+                return con.execute("""
+                    SELECT id, title, start_time_utc, league, sport, start_time
+                    FROM matches
+                    WHERE status='open'
+                      AND COALESCE(start_time_utc, start_time) >= ?
+                      AND COALESCE(start_time_utc, start_time) < ?
+                    ORDER BY COALESCE(start_time_utc, start_time) ASC
+                    LIMIT ? OFFSET ?
+                """, (start, end, PER_PAGE, offset)).fetchall()
             return con.execute("""
                 SELECT id, title, start_time_utc, league, sport, start_time
                 FROM matches
@@ -392,6 +482,16 @@ def get_open_matches_page(sport: str, page: int) -> List[sqlite3.Row]:
                 ORDER BY COALESCE(start_time_utc, start_time) ASC
                 LIMIT ? OFFSET ?
             """, (PER_PAGE, offset)).fetchall()
+        if start and end:
+            return con.execute("""
+                SELECT id, title, start_time_utc, league, sport, start_time
+                FROM matches
+                WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
+                  AND COALESCE(start_time_utc, start_time) >= ?
+                  AND COALESCE(start_time_utc, start_time) < ?
+                ORDER BY COALESCE(start_time_utc, start_time) ASC
+                LIMIT ? OFFSET ?
+            """, (sport, start, end, PER_PAGE, offset)).fetchall()
         return con.execute("""
             SELECT id, title, start_time_utc, league, sport, start_time
             FROM matches
@@ -720,12 +820,16 @@ async def sync_cmd(m: Message):
 @dp.message(F.text == BTN_ACTIVE)
 async def active_matches(m: Message):
     upsert_user_from_message(m)
+    set_pref(m.from_user.id, day_filter=get_pref(m.from_user.id, 'day_filter', 'all'))
     sports = get_open_sports()
     if not sports:
         await m.answer("Пока нет активных матчей.", reply_markup=main_menu())
         return
-    await m.answer("⚡ <b>Активные матчи</b>\n\nВыбери вид спорта 👇", reply_markup=main_menu())
-    await m.answer("Категории:", reply_markup=ikb_sports(sports))
+    await m.answer("⚡ <b>Активные матчи</b>
+
+Выбери фильтр по дате 👇", reply_markup=main_menu())
+    await m.answer("Фильтр:", reply_markup=ikb_day_filter(get_pref(m.from_user.id,'day_filter','all')))
+    await m.answer("Теперь выбери вид спорта 👇", reply_markup=ikb_sports(sports))
 
 @dp.callback_query(F.data.startswith("sport:"))
 async def cb_sport(cb: CallbackQuery):
@@ -738,27 +842,31 @@ async def cb_sport(cb: CallbackQuery):
         return
 
     sport = (sport or "all").lower()
-    total = count_open_matches(sport)
+    df = get_pref(cb.from_user.id, 'day_filter', 'all')
+    total = count_open_matches(sport, df)
     if total <= 0:
         await cb.answer("В этой категории матчей нет.", show_alert=True)
         return
     max_page = max(0, (total - 1) // PER_PAGE)
     page = min(max(page, 0), max_page)
 
-    items = get_open_matches_page(sport, page)
+    items = get_open_matches_page(sport, page, df)
     header = "📋 Все матчи" if sport == "all" else SPORT_PRETTY.get(sport, f"🏟 {sport}")
+    df_label = {'all':'🗂 Все даты','today':'📅 Сегодня','tomorrow':'📅 Завтра'}.get(df,'🗂 Все даты')
 
     blocks: List[str] = []
     for r in items:
         st = _pretty_time((r["start_time_utc"] or r["start_time"] or ""))
         league = (r["league"] or "").strip()
         title = _pretty_title((r["title"] or ""), (r["sport"] or sport))
+        code = _short_code(r["title"] or "")
+        time_short = st.split('•')[-1].strip() if '•' in st else st
         if league:
-            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🏆 {league}\n🕒 {st}")
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🏆 {league}\n🔖 {code} • {time_short}\n🕒 {st}")
         else:
-            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🕒 {st}")
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🔖 {code} • {time_short}\n🕒 {st}")
 
-    await cb.message.answer(f"{header}\n\n" + "\n\n".join(blocks), reply_markup=ikb_matches_list(sport, page, items, total))
+    await cb.message.answer(f"{header}  •  {df_label}\n\n" + "\n\n".join(blocks), reply_markup=ikb_matches_list(sport, page, items, total))
     await cb.answer()
 
 @dp.callback_query(F.data == "back:sports")
@@ -768,7 +876,8 @@ async def cb_back_sports(cb: CallbackQuery):
     if not sports:
         await cb.answer("Матчей нет.", show_alert=True)
         return
-    await cb.message.answer("⬅️ Назад. Выбери спорт:", reply_markup=ikb_sports(sports))
+    await cb.message.answer("⬅️ Назад. Фильтр по дате:", reply_markup=ikb_day_filter(get_pref(cb.from_user.id,'day_filter','all')))
+    await cb.message.answer("Выбери спорт:", reply_markup=ikb_sports(sports))
     await cb.answer()
 
 @dp.callback_query(F.data == "noop")
@@ -818,6 +927,8 @@ async def show_match_card(target: Message | CallbackQuery, match_id: int) -> Non
     title = _pretty_title((match["title"] or ""), (match["sport"] or "other"))
     league = (match["league"] or "").strip()
     st = _pretty_time((match["start_time_utc"] or match["start_time"] or ""))
+    code = _short_code(match["title"] or "")
+    time_short = st.split('•')[-1].strip() if '•' in st else st
 
     sep = "━━━━━━━━━━━━━━━━"
     text = (
@@ -827,7 +938,8 @@ async def show_match_card(target: Message | CallbackQuery, match_id: int) -> Non
 
         f"{sep}\n"
         f"<b>{title}</b>\n"
-        f"🏆 {league or '—'}\n\n"
+        f"🏆 {league or '—'}\n"
+        f"🔖 {code} • {time_short}\n\n"
         f"🕒 Старт: <i>{st}</i>\n\n"
         f"⏳ Дедлайн: <i>{dl_text}</i>
 "
@@ -887,6 +999,53 @@ async def cb_pick(cb: CallbackQuery):
         con.commit()
 
     await cb.answer("✅ Принято!", show_alert=True)
+
+
+@dp.message(F.text == BTN_FIND_MATCH)
+async def find_match(m: Message):
+    upsert_user_from_message(m)
+    set_pref(m.from_user.id, awaiting_match_search=True)
+    await m.answer("🔎 Напиши команду/часть названия (пример: <code>arsenal</code> или <code>real</code>):", reply_markup=main_menu())
+
+@dp.message()
+async def catch_text(m: Message):
+    # lightweight router for search input
+    if not m.text or not m.from_user:
+        return
+    if not get_pref(m.from_user.id, 'awaiting_match_search', False):
+        return
+    q = m.text.strip()
+    clear_pref(m.from_user.id, 'awaiting_match_search')
+    if len(q) < 2:
+        await m.answer("Слишком коротко. Попробуй 2+ символа.", reply_markup=main_menu())
+        return
+    ql = q.lower()
+    with db() as con:
+        rows = con.execute("""
+            SELECT id, title, start_time_utc, start_time, league, sport
+            FROM matches
+            WHERE status='open' AND LOWER(title) LIKE ?
+            ORDER BY COALESCE(start_time_utc, start_time) ASC
+            LIMIT 20
+        """, (f"%{ql}%",)).fetchall()
+    if not rows:
+        await m.answer("Ничего не нашёл 😕 Попробуй другое слово.", reply_markup=main_menu())
+        return
+    kb_rows = []
+    blocks = [f"🔎 <b>Найдено: {len(rows)}</b>\n"]
+    for r in rows:
+        mid = int(r['id'])
+        st = _pretty_time((r['start_time_utc'] or r['start_time'] or ''))
+        title = _pretty_title((r['title'] or ''), (r['sport'] or 'other'))
+        league = (r['league'] or '').strip()
+        code = _short_code(r['title'] or '')
+        time_short = st.split('•')[-1].strip() if '•' in st else st
+        if league:
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🏆 {league}\n🔖 {code} • {time_short}\n🕒 {st}")
+        else:
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🔖 {code} • {time_short}\n🕒 {st}")
+        kb_rows.append([InlineKeyboardButton(text=title[:48], callback_data=f"mopen:{mid}")])
+    await m.answer("\n\n".join(blocks), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 @dp.message(F.text == BTN_MY)
 async def my_predictions(m: Message):
@@ -1134,3 +1293,17 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+@dp.callback_query(F.data.startswith("day:"))
+async def cb_day(cb: CallbackQuery):
+    upsert_user_from_message(cb)
+    try:
+        df = cb.data.split(":", 1)[1].strip().lower()
+    except Exception:
+        df = 'all'
+    if df not in ('all','today','tomorrow'):
+        df = 'all'
+    set_pref(cb.from_user.id, day_filter=df)
+    sports = get_open_sports()
+    await cb.message.answer("✅ Фильтр установлен. Выбери спорт:", reply_markup=ikb_sports(sports))
+    await cb.answer()
