@@ -785,7 +785,7 @@ async def start_web_server():
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     upsert_user_from_message(m)
-    await m.answer(
+    text_msg = (
         "👋 <b>Привет!</b>
 
 "
@@ -794,9 +794,9 @@ async def cmd_start(m: Message):
         "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч → исход.
 
 "
-        f"⏱ Дедлайн прогнозов: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта.",
-        reply_markup=main_menu(),
+        f"⏱ Дедлайн прогнозов: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта."
     )
+    await m.answer(text_msg, reply_markup=main_menu())
 
 @dp.message(Command("help"))
 @dp.message(F.text == BTN_HELP)
