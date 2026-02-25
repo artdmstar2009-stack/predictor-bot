@@ -54,6 +54,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -101,6 +102,9 @@ AUTO_RESULTS_MIN_AGE_MIN = int(os.getenv("AUTO_RESULTS_MIN_AGE_MIN", "20") or "2
 KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "0") == "1"
 KEEPALIVE_URL = (os.getenv("KEEPALIVE_URL") or "").strip()
 KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "300") or "300")
+
+# render web service port binding
+PORT = int(os.getenv("PORT", "0") or "0")
 
 # scoring
 POINTS_FOR_CORRECT = int(os.getenv("POINTS_FOR_CORRECT", "3") or "3")
@@ -632,6 +636,37 @@ async def profile(m: Message):
     pts = int(r["points"]) if r else 0
     await m.answer(f"👤 Профиль\n\nОчки: <b>{pts}</b>")
 
+
+# =========================
+# WEB SERVER (Render Web Service)
+# =========================
+async def start_web_server():
+    """
+    Render Web Service requires an open port.
+    This starts a tiny HTTP server on 0.0.0.0:$PORT with:
+      GET /        -> "ok"
+      GET /health  -> "ok"
+    """
+    if PORT <= 0:
+        return
+
+    async def handle_root(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_root)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    logger.info("web server started on 0.0.0.0:%s", PORT)
+
+    # keep running forever
+    while True:
+        await asyncio.sleep(3600)
+
 # =========================
 # BACKGROUND LOOPS
 # =========================
@@ -739,6 +774,9 @@ async def keepalive_loop():
 # =========================
 async def main():
     init_db()
+
+    # start tiny web server for Render (if PORT is set)
+    asyncio.create_task(start_web_server())
 
     # start background
     if SYNC_ENABLED:
