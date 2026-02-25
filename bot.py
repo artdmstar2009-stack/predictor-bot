@@ -786,11 +786,15 @@ async def start_web_server():
 async def cmd_start(m: Message):
     upsert_user_from_message(m)
     await m.answer(
-        "👋 <b>Привет!</b>\n\n"
-        "Это бот прогнозов <b>1X2</b>.\n"
+        "👋 <b>Привет!</b>
+
+"
+        "Это бот прогнозов <b>1X2</b>.
+"
         "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч → исход.
 
-⏱ Дедлайн прогнозов: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта.",
+"
+        f"⏱ Дедлайн прогнозов: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта.",
         reply_markup=main_menu(),
     )
 
