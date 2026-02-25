@@ -92,6 +92,9 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 PORT = int(os.getenv("PORT", "0") or "0")
 
+# deadline (minutes before start)
+PREDICT_DEADLINE_MIN = int(os.getenv("PREDICT_DEADLINE_MIN", "5") or "5")
+
 # autosync
 SYNC_ENABLED = os.getenv("SYNC_ENABLED", "1") == "1"
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "3600") or "3600")
@@ -685,7 +688,9 @@ async def cmd_start(m: Message):
     await m.answer(
         "👋 <b>Привет!</b>\n\n"
         "Это бот прогнозов <b>1X2</b>.\n"
-        "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч → исход.",
+        "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч → исход.
+
+⏱ Дедлайн прогнозов: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта.",
         reply_markup=main_menu(),
     )
 
@@ -816,10 +821,19 @@ async def show_match_card(target: Message | CallbackQuery, match_id: int) -> Non
 
     sep = "━━━━━━━━━━━━━━━━"
     text = (
+    dl = deadline_for_match(match)
+    dl_text = _pretty_time(iso(dl)) if dl else "—"
+    allowed, why = can_predict(match)
+
         f"{sep}\n"
         f"<b>{title}</b>\n"
         f"🏆 {league or '—'}\n\n"
         f"🕒 Старт: <i>{st}</i>\n\n"
+        f"⏳ Дедлайн: <i>{dl_text}</i>
+"
+        f"{'✅ Ставки открыты' if allowed else '🔒 ' + why}
+
+"
         f"📊 <b>Прогнозы</b>:\n"
         f"1️⃣ {pct(stats['1'])} ({stats['1']})   🤝 {pct(stats['X'])} ({stats['X']})   2️⃣ {pct(stats['2'])} ({stats['2']})\n"
         f"🎯 Твой выбор: <b>{my_pick or '—'}</b>\n"
@@ -860,8 +874,9 @@ async def cb_pick(cb: CallbackQuery):
     if not match:
         await cb.answer("Матч не найден.", show_alert=True)
         return
-    if match["status"] != "open":
-        await cb.answer("Матч закрыт.", show_alert=True)
+    ok, why = can_predict(match)
+    if not ok:
+        await cb.answer(why, show_alert=True)
         return
 
     with db() as con:
