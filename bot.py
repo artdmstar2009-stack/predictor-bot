@@ -1,55 +1,34 @@
 # -*- coding: utf-8 -*-
 """
 Predictor Bot (aiogram v3.7+)
-============================
-Версия: sporty UI, без комментариев, без показа ID матчей в тексте.
 
-✅ UI
-- Красивое меню
-- ⚡ Активные матчи -> выбор спорта -> матчи (пагинация) -> карточка матча
-- 🔥 Матч дня
+UI
+- Главное меню (кнопки)
+- ⚡ Активные матчи -> выбор спорта -> список матчей (пагинация) -> карточка матча
+- 🔎 Поиск матча по названию/командам
+- 🔖 Короткий код матча (ABC-DEF • HH:MM)
 
-✅ Функции
-- 1X2 исходы
-- Автосинк (football-data.org + NHL)
-- Авто-итоги (начисление очков)
-- Лидерборд (неделя/месяц/сезон)
-- Профиль
-
-✅ Стабильность
-- Polling auto-restart
-- HTTP health server для Render Web Service (0.0.0.0:$PORT)
+Функции
+- Только 1X2
+- Дедлайн прогнозов: PREDICT_DEADLINE_MIN минут до старта
+- Автосинк матчей: football-data.org + NHL
+- Авто-итоги и начисление очков
+- Профиль + лидерборд
+- Keep-alive (Render free): пинг public /health если задан KEEP_ALIVE_URL
+- Render health server на 0.0.0.0:$PORT (если PORT задан)
 
 ENV
----
-Required:
-- BOT_TOKEN
-
-Recommended:
-- ADMIN_ID
-- PORT (Render ставит сам)
-
-Autosync:
-- SYNC_ENABLED=1
-- SYNC_INTERVAL=3600
-- SYNC_LOOKAHEAD_DAYS=1
-
-Football:
-- FOOTBALL_ENABLED=1
-- FOOTBALL_DATA_TOKEN=...
-- FOOTBALL_COMPETITIONS=PL,CL,PD,SA,BL1,FL1
-
-NHL:
+- BOT_TOKEN (required)
+- ADMIN_ID (optional)
+- PORT (Render sets; if you deploy as Web Service)
+- KEEP_ALIVE_URL (optional, e.g. https://<service>.onrender.com/health)
+- KEEP_ALIVE_INTERVAL=300
+- PREDICT_DEADLINE_MIN=5
+- SYNC_ENABLED=1, SYNC_INTERVAL=3600, SYNC_LOOKAHEAD_DAYS=1
+- FOOTBALL_ENABLED=1, FOOTBALL_DATA_TOKEN=..., FOOTBALL_COMPETITIONS=PL,CL,PD,SA,BL1,FL1
 - NHL_ENABLED=1
-
-Auto-results:
-- AUTO_RESULTS_ENABLED=1
-- AUTO_RESULTS_INTERVAL=300
-- AUTO_RESULTS_MIN_AGE_MIN=20
-
-Scoring:
-- POINTS_FOR_CORRECT=3
-- POINTS_FOR_WRONG=0
+- AUTO_RESULTS_ENABLED=1, AUTO_RESULTS_INTERVAL=300, AUTO_RESULTS_MIN_AGE_MIN=20
+- POINTS_FOR_CORRECT=3, POINTS_FOR_WRONG=0
 """
 
 from __future__ import annotations
@@ -80,9 +59,9 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-# ============================================================
+# =========================
 # CONFIG
-# ============================================================
+# =========================
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 if not BOT_TOKEN:
@@ -90,31 +69,44 @@ if not BOT_TOKEN:
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-
 PORT = int(os.getenv("PORT", "0") or "0")
 
-# autosync
+KEEP_ALIVE_URL = (os.getenv("KEEP_ALIVE_URL") or "").strip()
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "300") or "300")
+
+PREDICT_DEADLINE_MIN = int(os.getenv("PREDICT_DEADLINE_MIN", "5") or "5")
+
 SYNC_ENABLED = os.getenv("SYNC_ENABLED", "1") == "1"
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "3600") or "3600")
 SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", "1") or "1")
 
-# football-data
 FOOTBALL_ENABLED = os.getenv("FOOTBALL_ENABLED", "1") == "1"
 FOOTBALL_DATA_TOKEN = (os.getenv("FOOTBALL_DATA_TOKEN") or "").strip()
-FOOTBALL_COMPETITIONS = [c.strip() for c in (os.getenv("FOOTBALL_COMPETITIONS") or "PL,CL,PD,SA,BL1,FL1").split(",") if c.strip()]
+FOOTBALL_COMPETITIONS = [
+    c.strip()
+    for c in (os.getenv("FOOTBALL_COMPETITIONS") or "PL,CL,PD,SA,BL1,FL1").split(",")
+    if c.strip()
+]
 FOOTBALL_BASE = (os.getenv("FOOTBALL_BASE") or "https://api.football-data.org/v4").rstrip("/")
 
-# NHL
 NHL_ENABLED = os.getenv("NHL_ENABLED", "1") == "1"
 
-# auto-results
 AUTO_RESULTS_ENABLED = os.getenv("AUTO_RESULTS_ENABLED", "1") == "1"
 AUTO_RESULTS_INTERVAL = int(os.getenv("AUTO_RESULTS_INTERVAL", "300") or "300")
 AUTO_RESULTS_MIN_AGE_MIN = int(os.getenv("AUTO_RESULTS_MIN_AGE_MIN", "20") or "20")
 
-# scoring
 POINTS_FOR_CORRECT = int(os.getenv("POINTS_FOR_CORRECT", "3") or "3")
 POINTS_FOR_WRONG = int(os.getenv("POINTS_FOR_WRONG", "0") or "0")
+
+# Betting / bankroll
+BETTING_ENABLED = os.getenv("BETTING_ENABLED", "1") == "1"
+WEEKLY_BONUS_ENABLED = os.getenv("WEEKLY_BONUS_ENABLED", "1") == "1"
+WEEKLY_BONUS_AMOUNT = int(os.getenv("WEEKLY_BONUS_AMOUNT", "1000") or "1000")
+DISPLAY_TZ = os.getenv("DISPLAY_TZ", "Europe/Moscow")
+try:
+    DISPLAY_ZONE = ZoneInfo(DISPLAY_TZ)
+except Exception:
+    DISPLAY_ZONE = ZoneInfo("Europe/Moscow")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
@@ -123,9 +115,27 @@ logger = logging.getLogger("predictor_bot")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ============================================================
-# DB + utils
-# ============================================================
+# =========================
+# IN-MEMORY PREFS
+# =========================
+
+PREFS: Dict[int, Dict[str, Any]] = {}
+
+def set_pref(user_id: int, **data: Any) -> None:
+    cur = PREFS.get(user_id, {})
+    cur.update(data)
+    PREFS[user_id] = cur
+
+def get_pref(user_id: int, key: str, default: Any = None) -> Any:
+    return PREFS.get(user_id, {}).get(key, default)
+
+def clear_pref(user_id: int, key: str) -> None:
+    if user_id in PREFS and key in PREFS[user_id]:
+        del PREFS[user_id][key]
+
+# =========================
+# DB + UTILS
+# =========================
 
 def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
@@ -134,9 +144,6 @@ def db() -> sqlite3.Connection:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-# Display timezone for users
-MOSCOW_TZ = ZoneInfo('Europe/Moscow')
 
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
@@ -177,7 +184,10 @@ def init_db() -> None:
             "ALTER TABLE matches ADD COLUMN external_id TEXT",
             "ALTER TABLE matches ADD COLUMN start_time_utc TEXT",
             "ALTER TABLE matches ADD COLUMN created_at TEXT",
-        ]:
+                    "ALTER TABLE matches ADD COLUMN odds_1 REAL",
+            "ALTER TABLE matches ADD COLUMN odds_x REAL",
+            "ALTER TABLE matches ADD COLUMN odds_2 REAL",
+]:
             try:
                 cur.execute(stmt)
             except sqlite3.OperationalError:
@@ -194,6 +204,15 @@ def init_db() -> None:
         )
         """)
 
+
+for stmt in [
+    "ALTER TABLE votes ADD COLUMN stake INTEGER",
+    "ALTER TABLE votes ADD COLUMN odds REAL",
+]:
+    try:
+        cur.execute(stmt)
+    except sqlite3.OperationalError:
+        pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS scores (
             user_id INTEGER PRIMARY KEY,
@@ -205,6 +224,14 @@ def init_db() -> None:
             updated_at TEXT
         )
         """)
+for stmt in [
+    "ALTER TABLE scores ADD COLUMN balance INTEGER DEFAULT 0",
+]:
+    try:
+        cur.execute(stmt)
+    except sqlite3.OperationalError:
+        pass
+
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS points_log (
@@ -254,12 +281,13 @@ def pretty_user(user_id: int) -> str:
     name = f"{(r['first_name'] or '').strip()} {(r['last_name'] or '').strip()}".strip()
     return name if name else str(user_id)
 
-# ============================================================
+# =========================
 # UI
-# ============================================================
+# =========================
 
 BTN_ACTIVE = "⚡ Активные матчи"
 BTN_TODAY = "🔥 Матч дня"
+BTN_FIND_MATCH = "🔎 Найти матч"
 BTN_MY = "🧾 Мои прогнозы"
 BTN_LB = "🏆 Лидерборд"
 BTN_PROFILE = "👤 Профиль"
@@ -274,8 +302,6 @@ SPORT_PRETTY = {
 }
 
 PER_PAGE = 10
-
-# ---------- Pretty formatting (sporty) ----------
 RU_MON = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
 
 def _sport_emoji(sport: str) -> str:
@@ -289,14 +315,13 @@ def _sport_emoji(sport: str) -> str:
     return "🏟"
 
 def _pretty_time(dt_raw: str) -> str:
-    """Format ISO datetime string for user display (Moscow time)."""
     if not dt_raw:
         return "—"
     try:
-        dt = datetime.fromisoformat(dt_raw.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
-        return f"{dt.day:02d} {RU_MON[dt.month-1]} • {dt.hour:02d}:{dt.minute:02d} МСК"
+        dt = datetime.fromisoformat(dt_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return f"{dt.day:02d} {RU_MON[dt.month-1]} • {dt.hour:02d}:{dt.minute:02d} UTC"
     except Exception:
-        return dt_raw.replace("T", " ").replace("+00:00", " МСК")
+        return dt_raw.replace("T", " ").replace("+00:00", " UTC")
 
 def _pretty_title(title: str, sport: str) -> str:
     t = (title or "").strip()
@@ -308,11 +333,28 @@ def _pretty_title(title: str, sport: str) -> str:
             t = f"{a.upper()} 🆚 {b.upper()}"
     return f"{_sport_emoji(sport)} {t}"
 
+def _abbr_team(name: str) -> str:
+    s = re.sub(r"[^A-Za-zА-Яа-я0-9 ]+", " ", name).strip()
+    if not s:
+        return "---"
+    parts = [p for p in s.split() if p]
+    base = (parts[0] if parts else s)[:3]
+    return base.upper()
+
+def _short_code(title: str) -> str:
+    t = re.sub(r"\s+vs\.?\s+", " 🆚 ", (title or ""), flags=re.I)
+    t = re.sub(r"\s+-\s+", " 🆚 ", t)
+    if "🆚" in t:
+        a, b = [p.strip() for p in t.split("🆚", 1)]
+        return f"{_abbr_team(a)}-{_abbr_team(b)}"
+    return _abbr_team(t)
+
 def main_menu() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=BTN_ACTIVE), KeyboardButton(text=BTN_TODAY)],
-        [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_LB)],
-        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_FIND_MATCH), KeyboardButton(text=BTN_MY)],
+        [KeyboardButton(text=BTN_LB), KeyboardButton(text=BTN_PROFILE)],
+        [KeyboardButton(text=BTN_HELP)],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -330,8 +372,8 @@ def ikb_matches_list(sport: str, page: int, items: List[sqlite3.Row], total: int
     for r in items:
         mid = int(r["id"])
         title = _pretty_title((r["title"] or ""), (r["sport"] or sport))
-        if len(title) > 40:
-            title = title[:40] + "…"
+        if len(title) > 46:
+            title = title[:46] + "…"
         rows.append([InlineKeyboardButton(text=title, callback_data=f"mopen:{mid}")])
 
     max_page = max(0, (total - 1) // PER_PAGE)
@@ -347,19 +389,24 @@ def ikb_matches_list(sport: str, page: int, items: List[sqlite3.Row], total: int
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def ikb_match_card(match_id: int) -> InlineKeyboardMarkup:
+    odds = compute_live_odds(match_id) if BETTING_ENABLED else {"1": 0, "X": 0, "2": 0}
+    b1 = f"1 ({odds['1']})" if BETTING_ENABLED else "1"
+    bx = f"X ({odds['X']})" if BETTING_ENABLED else "X"
+    b2 = f"2 ({odds['2']})" if BETTING_ENABLED else "2"
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="1", callback_data=f"pick:{match_id}:1"),
-            InlineKeyboardButton(text="X", callback_data=f"pick:{match_id}:X"),
-            InlineKeyboardButton(text="2", callback_data=f"pick:{match_id}:2"),
+            InlineKeyboardButton(text=b1, callback_data=f"pick:{match_id}:1"),
+            InlineKeyboardButton(text=bx, callback_data=f"pick:{match_id}:X"),
+            InlineKeyboardButton(text=b2, callback_data=f"pick:{match_id}:2"),
         ],
+
         [InlineKeyboardButton(text="📊 Голоса", callback_data=f"stats:{match_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:sports")],
     ])
 
-# ============================================================
-# QUERIES
-# ============================================================
+# =========================
+# QUERIES + DEADLINE
+# =========================
 
 def get_open_sports() -> List[Tuple[str, int]]:
     with db() as con:
@@ -394,6 +441,7 @@ def get_open_matches_page(sport: str, page: int) -> List[sqlite3.Row]:
                 ORDER BY COALESCE(start_time_utc, start_time) ASC
                 LIMIT ? OFFSET ?
             """, (PER_PAGE, offset)).fetchall()
+
         return con.execute("""
             SELECT id, title, start_time_utc, league, sport, start_time
             FROM matches
@@ -421,9 +469,29 @@ def match_stats(match_id: int) -> Dict[str, int]:
             counts[p] += int(r["c"])
     return counts
 
-# ============================================================
-# AUTOSYNC MODELS + API
-# ============================================================
+def deadline_for_match(match_row: sqlite3.Row) -> Optional[datetime]:
+    st = (match_row["start_time_utc"] or match_row["start_time"] or "").strip()
+    if not st:
+        return None
+    try:
+        start_dt = parse_iso(st)
+    except Exception:
+        return None
+    return start_dt - timedelta(minutes=max(0, PREDICT_DEADLINE_MIN))
+
+def can_predict(match_row: sqlite3.Row) -> Tuple[bool, str]:
+    if match_row["status"] != "open":
+        return False, "Матч закрыт."
+    dl = deadline_for_match(match_row)
+    if not dl:
+        return True, ""
+    if now_utc() >= dl:
+        return False, f"Ставки закрыты (дедлайн за {PREDICT_DEADLINE_MIN} мин до старта)."
+    return True, ""
+
+# =========================
+# AUTOSYNC + RESULTS
+# =========================
 
 @dataclass
 class SyncedMatch:
@@ -452,7 +520,6 @@ async def football_list(session: aiohttp.ClientSession, date_from: datetime, dat
     df = date_from.date().isoformat()
     dt = date_to.date().isoformat()
     out: List[SyncedMatch] = []
-
     for comp in FOOTBALL_COMPETITIONS:
         url = f"{FOOTBALL_BASE}/competitions/{comp}/matches?dateFrom={df}&dateTo={dt}"
         try:
@@ -460,7 +527,6 @@ async def football_list(session: aiohttp.ClientSession, date_from: datetime, dat
         except Exception as e:
             logger.warning("football list failed comp=%s err=%s", comp, e)
             continue
-
         for m in (data.get("matches") or []):
             mid = str(m.get("id") or "")
             utc = m.get("utcDate") or ""
@@ -470,7 +536,6 @@ async def football_list(session: aiohttp.ClientSession, date_from: datetime, dat
                 start = datetime.fromisoformat(utc.replace("Z", "+00:00")).astimezone(timezone.utc)
             except Exception:
                 continue
-
             home = ((m.get("homeTeam") or {}).get("name") or "").strip()
             away = ((m.get("awayTeam") or {}).get("name") or "").strip()
             league = ((m.get("competition") or {}).get("name") or comp).strip()
@@ -482,8 +547,7 @@ async def football_result(session: aiohttp.ClientSession, external_id: str) -> O
     if not FOOTBALL_DATA_TOKEN:
         return None
     headers = {"X-Auth-Token": FOOTBALL_DATA_TOKEN}
-    url = f"{FOOTBALL_BASE}/matches/{external_id}"
-    data = await http_json(session, url, headers=headers)
+    data = await http_json(session, f"{FOOTBALL_BASE}/matches/{external_id}", headers=headers)
     match = data.get("match") or {}
     status = (match.get("status") or "").upper()
     if status not in ("FINISHED", "AWARDED"):
@@ -525,8 +589,7 @@ async def nhl_list(session: aiohttp.ClientSession, date_from: datetime, date_to:
             except Exception as e:
                 logger.warning("nhl schedule failed day=%s err=%s", ds, e)
                 data = None
-
-        games = []
+        games: List[Dict[str, Any]] = []
         if data:
             if "gameWeek" in data:
                 for d in data.get("gameWeek", []) or []:
@@ -536,7 +599,6 @@ async def nhl_list(session: aiohttp.ClientSession, date_from: datetime, date_to:
             elif "dates" in data:
                 for d in data.get("dates", []) or []:
                     games.extend(d.get("games", []) or [])
-
         for g in games:
             gid = str(g.get("id") or g.get("gamePk") or "")
             if not gid:
@@ -548,22 +610,19 @@ async def nhl_list(session: aiohttp.ClientSession, date_from: datetime, date_to:
                 start = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
             except Exception:
                 continue
-
             if "homeTeam" in g:
                 home = str(((g["homeTeam"].get("placeName") or {}).get("default")) or g["homeTeam"].get("name", ""))
                 away = str(((g["awayTeam"].get("placeName") or {}).get("default")) or g["awayTeam"].get("name", ""))
             else:
                 home = ((g.get("teams") or {}).get("home") or {}).get("team", {}).get("name", "")
                 away = ((g.get("teams") or {}).get("away") or {}).get("team", {}).get("name", "")
-            title = f"{home} vs {away}"
-            out.append(SyncedMatch("nhl", gid, "hockey", "NHL", title, start))
+            out.append(SyncedMatch("nhl", gid, "hockey", "NHL", f"{home} vs {away}", start))
         day = day + timedelta(days=1)
     return out
 
 async def nhl_result(session: aiohttp.ClientSession, external_id: str) -> Optional[FinishedInfo]:
-    gid = external_id
     try:
-        data = await http_json(session, f"https://api-web.nhle.com/v1/gamecenter/{gid}/landing")
+        data = await http_json(session, f"https://api-web.nhle.com/v1/gamecenter/{external_id}/landing")
         state = (data.get("gameState") or "").upper()
         if state not in ("FINAL", "OFF", "OVER"):
             return None
@@ -620,13 +679,9 @@ async def autosync_once() -> str:
             report.append(f"NHL {len(nm)}")
         ins, upd = upsert_matches(allm)
         report.append(f"DB +{ins}/~{upd}")
-    text = "Sync: " + " | ".join(report) if report else "Sync: nothing"
-    logger.info(text)
-    return text
-
-# ============================================================
-# FEATURED MATCH OF THE DAY
-# ============================================================
+    msg = "Sync: " + " | ".join(report) if report else "Sync: nothing"
+    logger.info(msg)
+    return msg
 
 def today_key() -> str:
     return now_utc().date().isoformat()
@@ -637,12 +692,10 @@ def pick_featured_for_today() -> Optional[int]:
         r = con.execute("SELECT match_id FROM featured WHERE day_utc=?", (day,)).fetchone()
         if r:
             return int(r["match_id"])
-
         start = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         row = con.execute("""
-            SELECT id
-            FROM matches
+            SELECT id FROM matches
             WHERE status='open'
               AND COALESCE(start_time_utc, start_time) >= ?
               AND COALESCE(start_time_utc, start_time) < ?
@@ -656,11 +709,257 @@ def pick_featured_for_today() -> Optional[int]:
         con.commit()
         return mid
 
-# ============================================================
-# WEB SERVER (Render Web Service)
-# ============================================================
+    async def apply_scoring_for_match(match_id: int, result_1x2: str) -> None:
+        with db() as con:
+            cur = con.cursor()
+            st = cur.execute("SELECT status FROM matches WHERE id=?", (match_id,)).fetchone()
+            if not st or st["status"] != "open":
+                return
+
+            cur.execute("UPDATE matches SET result=?, status='closed' WHERE id=?", (result_1x2, match_id))
+
+            votes = cur.execute("SELECT user_id, pick, stake, odds FROM votes WHERE match_id=?", (match_id,)).fetchall()
+            for v in votes:
+                uid = int(v["user_id"])
+                pick = v["pick"]
+                stake = int(v["stake"]) if v["stake"] is not None else 0
+                odds = float(v["odds"]) if v["odds"] is not None else 0.0
+
+                correct = (pick == result_1x2)
+                delta_points = POINTS_FOR_CORRECT if correct else POINTS_FOR_WRONG
+
+                cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
+
+                # points/streak
+                if correct:
+                    cur.execute(
+                        """
+                        UPDATE scores
+                        SET points = points + ?,
+                            correct = correct + 1,
+                            total = total + 1,
+                            streak = streak + 1,
+                            best_streak = CASE WHEN streak + 1 > best_streak THEN streak + 1 ELSE best_streak END,
+                            updated_at = ?
+                        WHERE user_id=?
+                        """,
+                        (delta_points, iso(now_utc()), uid),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE scores
+                        SET points = points + ?,
+                            total = total + 1,
+                            streak = 0,
+                            updated_at = ?
+                        WHERE user_id=?
+                        """,
+                        (delta_points, iso(now_utc()), uid),
+                    )
+
+                if delta_points != 0:
+                    cur.execute(
+                        "INSERT INTO points_log(user_id, match_id, points, created_at) VALUES(?,?,?,?)",
+                        (uid, match_id, delta_points, iso(now_utc())),
+                    )
+
+                # betting settlement
+                win_amount = 0
+                net_profit = 0
+                if BETTING_ENABLED and stake > 0 and odds > 0:
+                    if correct:
+                        win_amount = int(round(stake * odds))
+                        net_profit = win_amount - stake
+                        cur.execute("UPDATE scores SET balance = balance + ? WHERE user_id=?", (win_amount, uid))
+                    else:
+                        net_profit = -stake
+
+            con.commit()
+
+        # Notify users (outside transaction)
+        try:
+            match = get_match(match_id)
+            title = _pretty_title((match["title"] or ""), (match["sport"] or "other")) if match else f"Матч #{match_id}"
+        except Exception:
+            title = f"Матч #{match_id}"
+
+        for v in votes:
+            try:
+                uid = int(v["user_id"])
+                pick = v["pick"]
+                stake = int(v["stake"]) if v["stake"] is not None else 0
+                odds = float(v["odds"]) if v["odds"] is not None else 0.0
+                correct = (pick == result_1x2)
+
+                # fetch new balance
+                with db() as con:
+                    r = con.execute("SELECT balance, points FROM scores WHERE user_id=?", (uid,)).fetchone()
+                bal = int(r["balance"]) if r and r["balance"] is not None else 0
+
+                if BETTING_ENABLED and stake > 0 and odds > 0:
+                    if correct:
+                        win_amount = int(round(stake * odds))
+                        profit = win_amount - stake
+                        await bot.send_message(
+                            uid,
+                            f"✅ <b>Результат матча</b>\n{title}\n\n"
+                            f"Итог: <b>{result_1x2}</b>\n"
+                            f"Твой прогноз: <b>{pick}</b>\n\n"
+                            f"💰 Ты выиграл: <b>{win_amount}</b> (профит {profit:+d})\n"
+                            f"Баланс: <b>{bal}</b>",
+                        )
+                    else:
+                        await bot.send_message(
+                            uid,
+                            f"❌ <b>Результат матча</b>\n{title}\n\n"
+                            f"Итог: <b>{result_1x2}</b>\n"
+                            f"Твой прогноз: <b>{pick}</b>\n\n"
+                            f"💸 Ты проиграл: <b>{stake}</b>\n"
+                            f"Баланс: <b>{bal}</b>",
+                        )
+                else:
+                    # points-only notification (optional)
+                    await bot.send_message(
+                        uid,
+                        f"🏁 Матч завершён\n{title}\n"
+                        f"Итог: <b>{result_1x2}</b>\n"
+                        f"Твой прогноз: <b>{pick}</b>",
+                    )
+            except Exception:
+                pass
+
+async def autosync_loop():
+    while True:
+        try:
+            if SYNC_ENABLED:
+                await autosync_once()
+                pick_featured_for_today()
+        except Exception as e:
+            logger.exception("autosync_loop error: %s", e)
+        await asyncio.sleep(max(300, SYNC_INTERVAL))
+
+async def auto_results_loop():
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                await asyncio.sleep(max(30, AUTO_RESULTS_INTERVAL))
+                if not AUTO_RESULTS_ENABLED:
+                    continue
+
+                cutoff = now_utc() - timedelta(minutes=max(0, AUTO_RESULTS_MIN_AGE_MIN))
+                cutoff_s = iso(cutoff)
+
+                with db() as con:
+                    candidates = con.execute("""
+                        SELECT id, source, external_id
+                        FROM matches
+                        WHERE status='open'
+                          AND source IS NOT NULL AND external_id IS NOT NULL
+                          AND COALESCE(start_time_utc, start_time) <= ?
+                        ORDER BY COALESCE(start_time_utc, start_time) ASC
+                        LIMIT 80
+                    """, (cutoff_s,)).fetchall()
+
+                for r in candidates:
+                    mid = int(r["id"])
+                    source = (r["source"] or "").lower()
+                    ext = (r["external_id"] or "").strip()
+                    if not ext:
+                        continue
+
+                    fin: Optional[FinishedInfo] = None
+                    if source == "football":
+                        try:
+                            fin = await football_result(session, ext)
+                        except Exception as e:
+                            logger.warning("football_result failed: %s", e)
+                    elif source == "nhl":
+                        try:
+                            fin = await nhl_result(session, ext)
+                        except Exception as e:
+                            logger.warning("nhl_result failed: %s", e)
+
+                    if not fin:
+                        continue
+
+                    await apply_scoring_for_match(mid, fin.result_1x2)
+
+                    if ADMIN_ID:
+                        try:
+                            await bot.send_message(ADMIN_ID, f"✅ Итог проставлен: {fin.result_1x2}")
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.exception("auto_results_loop error: %s", e)
+
+
+    def next_weekly_bonus_run(now: datetime) -> datetime:
+        """Next Monday 12:00 in DISPLAY_ZONE."""
+        local = now.astimezone(DISPLAY_ZONE)
+        # Monday=0
+        days_ahead = (0 - local.weekday()) % 7
+        target = local.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+        if target <= local:
+            target = target + timedelta(days=7)
+        return target.astimezone(timezone.utc)
+
+    async def weekly_bonus_loop():
+        if not WEEKLY_BONUS_ENABLED:
+            return
+        while True:
+            try:
+                run_at = next_weekly_bonus_run(now_utc())
+                sleep_s = max(5, int((run_at - now_utc()).total_seconds()))
+                await asyncio.sleep(sleep_s)
+
+                # award
+                with db() as con:
+                    cur = con.cursor()
+                    user_rows = cur.execute("SELECT user_id FROM users").fetchall()
+                    uids = [int(r["user_id"]) for r in user_rows]
+                    for uid in uids:
+                        cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
+                    cur.execute("UPDATE scores SET balance = COALESCE(balance,0) + ?, updated_at=?", (WEEKLY_BONUS_AMOUNT, iso(now_utc())))
+                    con.commit()
+
+                # notify
+                for uid in uids:
+                    try:
+                        await bot.send_message(
+                            uid,
+                            f"🎁 Еженедельный бонус: +<b>{WEEKLY_BONUS_AMOUNT}</b> баллов!\n"
+                            f"Выдан в понедельник 12:00 по МСК.",
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.exception("weekly_bonus_loop error: %s", e)
+                await asyncio.sleep(60)
+
+async def keep_alive_loop():
+    """Keep Render free Web Service from spinning down.
+    Set KEEP_ALIVE_URL to your public /health URL and it will ping it periodically.
+    """
+    if not KEEP_ALIVE_URL:
+        return
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(KEEP_ALIVE_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    await resp.text()
+                logger.debug("keep-alive ping ok")
+            except Exception as e:
+                logger.warning("keep-alive ping failed: %s", e)
+            await asyncio.sleep(max(60, KEEP_ALIVE_INTERVAL))
+
+# =========================
+# WEB SERVER (Render)
+# =========================
 
 async def start_web_server():
+    # If you deploy as Render Web Service, PORT must be bound.
     if PORT <= 0:
         return
 
@@ -680,9 +979,9 @@ async def start_web_server():
     while True:
         await asyncio.sleep(3600)
 
-# ============================================================
+# =========================
 # HANDLERS
-# ============================================================
+# =========================
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
@@ -690,8 +989,8 @@ async def cmd_start(m: Message):
     text_msg = (
         "👋 <b>Привет!</b>\n\n"
         "Это бот прогнозов <b>1X2</b>.\n"
-        "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч → исход.\n\n"
-        f"⏱ Дедлайн прогнозов: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта."
+        "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч.\n\n"
+        f"⏱ Дедлайн: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта."
     )
     await m.answer(text_msg, reply_markup=main_menu())
 
@@ -702,9 +1001,8 @@ async def help_btn(m: Message):
     await m.answer(
         "ℹ️ <b>Помощь</b>\n\n"
         "• ⚡ Активные матчи → спорт → матч → 1/X/2\n"
-        "• 🔥 Матч дня — быстрый доступ к матчу сегодня\n"
-        "• 🧾 Мои прогнозы — твои ставки\n"
-        "• 🏆 Лидерборд — топ игроков\n\n"
+        "• 🔎 Найти матч — поиск по команде/части названия\n"
+        "• 🔥 Матч дня — быстрый доступ к матчу сегодня\n\n"
         f"Очки за верный исход: <b>+{POINTS_FOR_CORRECT}</b>",
         reply_markup=main_menu(),
     )
@@ -712,7 +1010,7 @@ async def help_btn(m: Message):
 @dp.message(Command("sync_now"))
 async def sync_cmd(m: Message):
     upsert_user_from_message(m)
-    if not is_admin(m.from_user.id):
+    if not m.from_user or not is_admin(m.from_user.id):
         return
     msg = await autosync_once()
     pick_featured_for_today()
@@ -743,6 +1041,7 @@ async def cb_sport(cb: CallbackQuery):
     if total <= 0:
         await cb.answer("В этой категории матчей нет.", show_alert=True)
         return
+
     max_page = max(0, (total - 1) // PER_PAGE)
     page = min(max(page, 0), max_page)
 
@@ -754,12 +1053,17 @@ async def cb_sport(cb: CallbackQuery):
         st = _pretty_time((r["start_time_utc"] or r["start_time"] or ""))
         league = (r["league"] or "").strip()
         title = _pretty_title((r["title"] or ""), (r["sport"] or sport))
+        code = _short_code(r["title"] or "")
+        time_short = st.split("•")[-1].strip() if "•" in st else st
         if league:
-            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🏆 {league}\n🕒 {st}")
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🏆 {league}\n🔖 {code} • {time_short}\n🕒 {st}")
         else:
-            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🕒 {st}")
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🔖 {code} • {time_short}\n🕒 {st}")
 
-    await cb.message.answer(f"{header}\n\n" + "\n\n".join(blocks), reply_markup=ikb_matches_list(sport, page, items, total))
+    await cb.message.answer(
+        f"{header}\n\n" + "\n\n".join(blocks),
+        reply_markup=ikb_matches_list(sport, page, items, total),
+    )
     await cb.answer()
 
 @dp.callback_query(F.data == "back:sports")
@@ -811,32 +1115,45 @@ async def show_match_card(target: Message | CallbackQuery, match_id: int) -> Non
     def pct(n: int) -> str:
         if total_votes <= 0:
             return "0%"
-        return f"{round((n/total_votes)*100)}%"
+        return f"{round((n / total_votes) * 100)}%"
 
     user_id = target.from_user.id if target.from_user else 0  # type: ignore
     my_pick = get_my_pick(user_id, match_id) if user_id else None
+    odds = compute_live_odds(match_id) if BETTING_ENABLED else None
+    bal = get_balance(user_id) if (BETTING_ENABLED and user_id) else None
 
     title = _pretty_title((match["title"] or ""), (match["sport"] or "other"))
     league = (match["league"] or "").strip()
     st = _pretty_time((match["start_time_utc"] or match["start_time"] or ""))
+    code = _short_code(match["title"] or "")
+    time_short = st.split("•")[-1].strip() if "•" in st else st
+
+    dl = deadline_for_match(match)
+    dl_text = _pretty_time(iso(dl)) if dl else "—"
+    allowed, why = can_predict(match)
 
     sep = "━━━━━━━━━━━━━━━━"
-    text = (
+    text_msg = (
         f"{sep}\n"
         f"<b>{title}</b>\n"
-        f"🏆 {league or '—'}\n\n"
-        f"🕒 Старт: <i>{st}</i>\n\n"
+        f"🏆 {league or '—'}\n"
+        f"🔖 {code} • {time_short}\n\n"
+        f"🕒 Старт: <i>{st}</i>\n"
+        f"⏳ Дедлайн: <i>{dl_text}</i>\n"
+        f"{'✅ Ставки открыты' if allowed else '🔒 ' + why}\n\n"
         f"📊 <b>Прогнозы</b>:\n"
         f"1️⃣ {pct(stats['1'])} ({stats['1']})   🤝 {pct(stats['X'])} ({stats['X']})   2️⃣ {pct(stats['2'])} ({stats['2']})\n"
         f"🎯 Твой выбор: <b>{my_pick or '—'}</b>\n"
-        f"{sep}\n\n"
+        + (f"💰 Баланс: <b>{bal}</b>\n" if bal is not None else "")
+        + (f"📈 Коэф: 1=<b>{odds['1']}</b>  X=<b>{odds['X']}</b>  2=<b>{odds['2']}</b>\n" if odds else "")
+        + f"{sep}\n\n"
         "Выбери исход 1X2:"
     )
 
     if isinstance(target, Message):
-        await target.answer(text, reply_markup=ikb_match_card(match_id))
+        await target.answer(text_msg, reply_markup=ikb_match_card(match_id))
     else:
-        await target.message.answer(text, reply_markup=ikb_match_card(match_id))
+        await target.message.answer(text_msg, reply_markup=ikb_match_card(match_id))
 
 @dp.callback_query(F.data.startswith("stats:"))
 async def cb_stats(cb: CallbackQuery):
@@ -848,40 +1165,188 @@ async def cb_stats(cb: CallbackQuery):
     s = match_stats(match_id)
     await cb.answer(f"1={s['1']}  X={s['X']}  2={s['2']}", show_alert=True)
 
-@dp.callback_query(F.data.startswith("pick:"))
-async def cb_pick(cb: CallbackQuery):
-    upsert_user_from_message(cb)
-    try:
-        _, match_id_s, pick = cb.data.split(":")
-        match_id = int(match_id_s)
-    except Exception:
-        await cb.answer("Ошибка.", show_alert=True)
-        return
+    @dp.callback_query(F.data.startswith("pick:"))
+    async def cb_pick(cb: CallbackQuery):
+        upsert_user_from_message(cb)
+        try:
+            _, match_id_s, pick = cb.data.split(":")
+            match_id = int(match_id_s)
+        except Exception:
+            await cb.answer("Ошибка.", show_alert=True)
+            return
+        if pick not in ("1", "X", "2"):
+            await cb.answer("Неверный исход.", show_alert=True)
+            return
 
-    if pick not in ("1", "X", "2"):
-        await cb.answer("Неверный исход.", show_alert=True)
-        return
+        match = get_match(match_id)
+        if not match:
+            await cb.answer("Матч не найден.", show_alert=True)
+            return
 
-    match = get_match(match_id)
-    if not match:
-        await cb.answer("Матч не найден.", show_alert=True)
-        return
-    if match["status"] != "open":
-        await cb.answer("Матч закрыт.", show_alert=True)
-        return
+        ok, why = can_predict(match)
+        if not ok:
+            await cb.answer(why, show_alert=True)
+            return
 
-    with db() as con:
-        con.execute(
-            "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at) VALUES(?,?,?,?)",
-            (cb.from_user.id, match_id, pick, iso(now_utc())),
+        if not BETTING_ENABLED:
+            with db() as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at) VALUES(?,?,?,?)",
+                    (cb.from_user.id, match_id, pick, iso(now_utc())),
+                )
+                con.commit()
+            await cb.answer("✅ Принято!", show_alert=True)
+            return
+
+        # Betting flow: ask stake
+        odds = compute_live_odds(match_id)
+        set_pref(cb.from_user.id, awaiting_stake=True, bet_match_id=match_id, bet_pick=pick, bet_odds=odds.get(pick, 2.0))
+        bal = get_balance(cb.from_user.id)
+        await cb.message.answer(
+            f"💸 Введи сумму ставки (целое число).\n"
+            f"Текущий баланс: <b>{bal}</b>\n"
+            f"Твой исход: <b>{pick}</b> | Коэффициент: <b>{odds.get(pick, 2.0)}</b>\n\n"
+            f"Пример: <code>200</code>",
+            reply_markup=main_menu(),
         )
-        con.commit()
+        await cb.answer()
 
-    await cb.answer("✅ Принято!", show_alert=True)
+@dp.message(F.text == BTN_FIND_MATCH)
+async def find_match(m: Message):
+    upsert_user_from_message(m)
+    if not m.from_user:
+        return
+    set_pref(m.from_user.id, awaiting_match_search=True)
+    await m.answer(
+        "🔎 Напиши команду/часть названия (пример: <code>arsenal</code> или <code>real</code>):",
+        reply_markup=main_menu(),
+    )
+
+
+    @dp.message(lambda m: bool(getattr(m, "text", None)) and m.from_user and get_pref(m.from_user.id, "awaiting_stake", False))
+    async def stake_amount_handler(m: Message):
+        upsert_user_from_message(m)
+        uid = m.from_user.id
+        raw = (m.text or "").strip()
+
+        # clear flag first to avoid trapping user
+        clear_pref(uid, "awaiting_stake")
+
+        match_id = int(get_pref(uid, "bet_match_id", 0) or 0)
+        pick = str(get_pref(uid, "bet_pick", "") or "")
+        odds = float(get_pref(uid, "bet_odds", 2.0) or 2.0)
+
+        # cleanup
+        clear_pref(uid, "bet_match_id")
+        clear_pref(uid, "bet_pick")
+        clear_pref(uid, "bet_odds")
+
+        if not match_id or pick not in ("1", "X", "2"):
+            await m.answer("Ставка отменена.", reply_markup=main_menu())
+            return
+
+        match = get_match(match_id)
+        if not match:
+            await m.answer("Матч не найден.", reply_markup=main_menu())
+            return
+
+        ok, why = can_predict(match)
+        if not ok:
+            await m.answer(why, reply_markup=main_menu())
+            return
+
+        try:
+            stake = int(raw)
+        except Exception:
+            await m.answer("Нужно целое число (пример: 200).", reply_markup=main_menu())
+            return
+
+        if stake <= 0:
+            await m.answer("Ставка должна быть > 0.", reply_markup=main_menu())
+            return
+
+        # handle overwrite: refund previous stake if exists
+        with db() as con:
+            cur = con.cursor()
+            cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
+            prev = cur.execute("SELECT stake FROM votes WHERE user_id=? AND match_id=?", (uid, match_id)).fetchone()
+            prev_stake = int(prev["stake"]) if prev and prev["stake"] is not None else 0
+
+            bal = cur.execute("SELECT balance FROM scores WHERE user_id=?", (uid,)).fetchone()
+            balance = int(bal["balance"]) if bal and bal["balance"] is not None else 0
+
+            # refund previous stake (if any) before taking new stake
+            balance += prev_stake
+
+            if stake > balance:
+                await m.answer(f"Недостаточно средств. Доступно: <b>{balance}</b>", reply_markup=main_menu())
+                return
+
+            balance -= stake
+
+            cur.execute("UPDATE scores SET balance=?, updated_at=? WHERE user_id=?", (balance, iso(now_utc()), uid))
+            cur.execute(
+                "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at, stake, odds) VALUES(?,?,?,?,?,?)",
+                (uid, match_id, pick, iso(now_utc()), stake, odds),
+            )
+            con.commit()
+
+        await m.answer(
+            f"✅ Ставка принята!\n"
+            f"Исход: <b>{pick}</b>\n"
+            f"Сумма: <b>{stake}</b>\n"
+            f"Коэффициент: <b>{odds}</b>\n"
+            f"Баланс: <b>{balance}</b>",
+            reply_markup=main_menu(),
+        )
+
+# IMPORTANT: This handler MUST NOT match every message, иначе ломает кнопки.
+@dp.message(lambda m: bool(getattr(m, "text", None)) and m.from_user and get_pref(m.from_user.id, "awaiting_match_search", False))
+async def catch_text(m: Message):
+    # filter guarantees: text + from_user + awaiting flag
+    q = (m.text or "").strip()
+    clear_pref(m.from_user.id, "awaiting_match_search")
+
+    if len(q) < 2:
+        await m.answer("Слишком коротко. Попробуй 2+ символа.", reply_markup=main_menu())
+        return
+
+    ql = q.lower()
+    with db() as con:
+        rows = con.execute("""
+            SELECT id, title, start_time_utc, start_time, league, sport
+            FROM matches
+            WHERE status='open' AND LOWER(title) LIKE ?
+            ORDER BY COALESCE(start_time_utc, start_time) ASC
+            LIMIT 20
+        """, (f"%{ql}%",)).fetchall()
+
+    if not rows:
+        await m.answer("Ничего не нашёл 😕 Попробуй другое слово.", reply_markup=main_menu())
+        return
+
+    kb_rows: List[List[InlineKeyboardButton]] = []
+    blocks: List[str] = [f"🔎 <b>Найдено: {len(rows)}</b>\n"]
+    for r in rows:
+        mid = int(r["id"])
+        st = _pretty_time((r["start_time_utc"] or r["start_time"] or ""))
+        title = _pretty_title((r["title"] or ""), (r["sport"] or "other"))
+        league = (r["league"] or "").strip()
+        code = _short_code(r["title"] or "")
+        time_short = st.split("•")[-1].strip() if "•" in st else st
+        if league:
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🏆 {league}\n🔖 {code} • {time_short}\n🕒 {st}")
+        else:
+            blocks.append(f"━━━━━━━━━━━━━━━━\n<b>{title}</b>\n🔖 {code} • {time_short}\n🕒 {st}")
+        kb_rows.append([InlineKeyboardButton(text=title[:48], callback_data=f"mopen:{mid}")])
+
+    await m.answer("\n\n".join(blocks), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 @dp.message(F.text == BTN_MY)
 async def my_predictions(m: Message):
     upsert_user_from_message(m)
+    if not m.from_user:
+        return
     with db() as con:
         rows = con.execute("""
             SELECT v.match_id, v.pick, v.created_at, m.title, m.status, m.result, m.sport
@@ -938,7 +1403,6 @@ async def leaderboard(m: Message):
     upsert_user_from_message(m)
     week = start_of_week_utc(now_utc())
     month = start_of_month_utc(now_utc())
-
     top_season = season_top(10)
     top_w = top_points_since(week, 10)
     top_m = top_points_since(month, 10)
@@ -951,14 +1415,48 @@ async def leaderboard(m: Message):
             out.append(f"{i}. {pretty_user(uid)} — <b>{pts}</b>")
         return "\n".join(out) + "\n"
 
-    text = (
+    text_msg = (
         "🏆 <b>Лидерборд</b>\n\n"
         + fmt("📅 Неделя:", top_w) + "\n"
         + fmt("🗓 Месяц:", top_m) + "\n"
         + fmt("🏅 Сезон:", top_season)
     )
-    await m.answer(text, reply_markup=main_menu())
+    await m.answer(text_msg, reply_markup=main_menu())
 
+
+def get_balance(user_id: int) -> int:
+    s = get_score_row(user_id)
+    try:
+        return int(s["balance"])
+    except Exception:
+        return 0
+
+def compute_live_odds(match_id: int) -> Dict[str, float]:
+    """Simple crowd-based odds (no external odds feed).
+    The more people pick an outcome, the lower the odds.
+    """
+    s = match_stats(match_id)
+    total = s["1"] + s["X"] + s["2"]
+
+    # small priors so odds exist even with 0 votes
+    pri_1, pri_x, pri_2 = 2.0, 1.5, 2.0  # draw usually less likely
+    c1 = s["1"] + 1
+    cx = s["X"] + 1
+    c2 = s["2"] + 1
+    denom = (c1 + cx + c2)
+    p1 = c1 / denom
+    px = cx / denom
+    p2 = c2 / denom
+
+    def odds_from_p(p: float, margin: float = 0.08) -> float:
+        p = max(0.05, min(0.95, p))
+        o = (1.0 / p) * (1.0 - margin)
+        return max(1.15, round(o, 2))
+
+    o1 = odds_from_p(p1)
+    ox = odds_from_p(px)
+    o2 = odds_from_p(p2)
+    return {"1": o1, "X": ox, "2": o2}
 def get_score_row(user_id: int) -> sqlite3.Row:
     with db() as con:
         r = con.execute("SELECT * FROM scores WHERE user_id=?", (user_id,)).fetchone()
@@ -971,150 +1469,42 @@ def get_score_row(user_id: int) -> sqlite3.Row:
 @dp.message(F.text == BTN_PROFILE)
 async def profile(m: Message):
     upsert_user_from_message(m)
+    if not m.from_user:
+        return
     s = get_score_row(m.from_user.id)
-    text = (
-        f"👤 <b>Профиль</b>\n\n"
-        f"Игрок: {pretty_user(m.from_user.id)}\n"
-        f"Очки: <b>{int(s['points'])}</b>\n"
-        f"Победы: <b>{int(s['correct'])}</b> / Игр: <b>{int(s['total'])}</b>\n"
-        f"Серия: <b>{int(s['streak'])}</b> (лучшая {int(s['best_streak'])})\n"
+    await m.answer(
+        (
+            "👤 <b>Профиль</b>\n\n"
+            f"Игрок: {pretty_user(m.from_user.id)}\n"
+            f"Очки: <b>{int(s['points'])}</b>\n"
+            + (f"Баланс: <b>{int(s['balance'])}</b>\n" if BETTING_ENABLED else "")
+            + f"Победы: <b>{int(s['correct'])}</b> / Игр: <b>{int(s['total'])}</b>\n"
+            + f"Серия: <b>{int(s['streak'])}</b> (лучшая {int(s['best_streak'])})\n"
+        ),
+        reply_markup=main_menu(),
     )
-    await m.answer(text, reply_markup=main_menu())
-
-# ============================================================
-# BACKGROUND LOOPS
-# ============================================================
-
-async def autosync_loop():
-    while True:
-        try:
-            if SYNC_ENABLED:
-                await autosync_once()
-                pick_featured_for_today()
-        except Exception as e:
-            logger.exception("autosync_loop error: %s", e)
-        await asyncio.sleep(max(300, SYNC_INTERVAL))
-
-async def apply_scoring_for_match(match_id: int, result_1x2: str) -> None:
-    with db() as con:
-        cur = con.cursor()
-        st = cur.execute("SELECT status FROM matches WHERE id=?", (match_id,)).fetchone()
-        if not st or st["status"] != "open":
-            return
-
-        cur.execute("UPDATE matches SET result=?, status='closed' WHERE id=?", (result_1x2, match_id))
-
-        votes = cur.execute("SELECT user_id, pick FROM votes WHERE match_id=?", (match_id,)).fetchall()
-        for v in votes:
-            uid = int(v["user_id"])
-            pick = v["pick"]
-            correct = (pick == result_1x2)
-            delta = POINTS_FOR_CORRECT if correct else POINTS_FOR_WRONG
-
-            cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at) VALUES(?,?)", (uid, iso(now_utc())))
-
-            if correct:
-                cur.execute("""
-                    UPDATE scores
-                    SET points = points + ?,
-                        correct = correct + 1,
-                        total = total + 1,
-                        streak = streak + 1,
-                        best_streak = CASE WHEN streak + 1 > best_streak THEN streak + 1 ELSE best_streak END,
-                        updated_at = ?
-                    WHERE user_id=?
-                """, (delta, iso(now_utc()), uid))
-            else:
-                cur.execute("""
-                    UPDATE scores
-                    SET points = points + ?,
-                        total = total + 1,
-                        streak = 0,
-                        updated_at = ?
-                    WHERE user_id=?
-                """, (delta, iso(now_utc()), uid))
-
-            if delta != 0:
-                cur.execute("INSERT INTO points_log(user_id, match_id, points, created_at) VALUES(?,?,?,?)",
-                            (uid, match_id, delta, iso(now_utc())))
-
-        con.commit()
-
-async def auto_results_loop():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                await asyncio.sleep(max(30, AUTO_RESULTS_INTERVAL))
-                if not AUTO_RESULTS_ENABLED:
-                    continue
-
-                cutoff = now_utc() - timedelta(minutes=max(0, AUTO_RESULTS_MIN_AGE_MIN))
-                cutoff_s = iso(cutoff)
-
-                with db() as con:
-                    candidates = con.execute("""
-                        SELECT id, source, external_id
-                        FROM matches
-                        WHERE status='open'
-                          AND source IS NOT NULL AND external_id IS NOT NULL
-                          AND COALESCE(start_time_utc, start_time) <= ?
-                        ORDER BY COALESCE(start_time_utc, start_time) ASC
-                        LIMIT 80
-                    """, (cutoff_s,)).fetchall()
-
-                for r in candidates:
-                    mid = int(r["id"])
-                    source = (r["source"] or "").lower()
-                    ext = (r["external_id"] or "").strip()
-                    if not ext:
-                        continue
-
-                    fin: Optional[FinishedInfo] = None
-                    if source == "football":
-                        try:
-                            fin = await football_result(session, ext)
-                        except Exception as e:
-                            logger.warning("football_result failed: %s", e)
-                    elif source == "nhl":
-                        try:
-                            fin = await nhl_result(session, ext)
-                        except Exception as e:
-                            logger.warning("nhl_result failed: %s", e)
-
-                    if not fin:
-                        continue
-
-                    await apply_scoring_for_match(mid, fin.result_1x2)
-
-                    if ADMIN_ID:
-                        try:
-                            await bot.send_message(ADMIN_ID, f"✅ Итог проставлен: матч закрыт ({fin.result_1x2})")
-                        except Exception:
-                            pass
-
-            except Exception as e:
-                logger.exception("auto_results_loop error: %s", e)
-
-async def heartbeat_loop():
-    while True:
-        logger.info("heartbeat: alive")
-        await asyncio.sleep(900)
-
-# ============================================================
+# =========================
 # MAIN
-# ============================================================
+# =========================
 
 async def main():
     init_db()
 
+    # For Render Web Service: keep port open (health endpoint)
     asyncio.create_task(start_web_server())
-    asyncio.create_task(heartbeat_loop())
+
+    # Keep-alive ping (only if KEEP_ALIVE_URL is set)
+    asyncio.create_task(keep_alive_loop())
+
+    # Weekly bonus (Monday 12:00 MSK)
+    asyncio.create_task(weekly_bonus_loop())
 
     if SYNC_ENABLED:
         asyncio.create_task(autosync_loop())
     if AUTO_RESULTS_ENABLED:
         asyncio.create_task(auto_results_loop())
 
+    # Restart polling if it crashes (common on flaky hosting)
     while True:
         try:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
