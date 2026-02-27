@@ -100,7 +100,9 @@ POINTS_FOR_WRONG = int(os.getenv("POINTS_FOR_WRONG", "0") or "0")
 
 # Betting / bankroll (simple fixed stake)
 BETTING_ENABLED = os.getenv("BETTING_ENABLED", "1") == "1"
-BET_FIXED_STAKE = int(os.getenv("BET_FIXED_STAKE", "100") or "100")  # stake per prediction
+BET_FIXED_STAKE = int(os.getenv("BET_FIXED_STAKE", "100") or "100")  # fallback if presets disabled
+BET_STAKE_PRESETS = [int(x) for x in (os.getenv("BET_STAKE_PRESETS", "50,100,200,500,1000") or "").split(",") if x.strip().isdigit()]
+BET_MAX_STAKE = int(os.getenv("BET_MAX_STAKE", "100000") or "100000")
 WEEKLY_BONUS_ENABLED = os.getenv("WEEKLY_BONUS_ENABLED", "1") == "1"
 WEEKLY_BONUS_AMOUNT = int(os.getenv("WEEKLY_BONUS_AMOUNT", "1000") or "1000")
 
@@ -392,7 +394,7 @@ def ikb_matches_list(sport: str, page: int, items: List[sqlite3.Row], total: int
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def ikb_match_card(match_id: int) -> InlineKeyboardMarkup:
-    odds = compute_live_odds(match_id) if BETTING_ENABLED else {"1": 0, "X": 0, "2": 0}
+    odds = compute_bk_odds(match_id) if BETTING_ENABLED else {"1": 0, "X": 0, "2": 0}
     b1 = f"1 ({odds['1']})" if BETTING_ENABLED else "1"
     bx = f"X ({odds['X']})" if BETTING_ENABLED else "X"
     b2 = f"2 ({odds['2']})" if BETTING_ENABLED else "2"
@@ -479,20 +481,30 @@ def get_balance(user_id: int) -> int:
     except Exception:
         return 0
 
-def compute_live_odds(match_id: int) -> Dict[str, float]:
-    """Simple crowd-based odds."""
+def _round_bk(o: float) -> float:
+    # common bookmaker style: 2 decimals, cap
+    o = max(1.12, min(25.0, o))
+    return round(o + 1e-9, 2)
+
+def compute_bk_odds(match_id: int) -> Dict[str, float]:
+    """Bookmaker-like odds (no external feed).
+    Uses crowd sentiment + small priors and adds bookmaker margin (overround).
+    """
     s = match_stats(match_id)
-    c1 = s["1"] + 1
-    cx = s["X"] + 1
-    c2 = s["2"] + 1
+    # priors make odds exist even with 0 votes
+    c1 = s["1"] + 3
+    cx = s["X"] + 2
+    c2 = s["2"] + 3
     denom = c1 + cx + c2
     p1, px, p2 = c1 / denom, cx / denom, c2 / denom
 
-    def o(p: float) -> float:
-        p = max(0.05, min(0.95, p))
-        return max(1.15, round((1.0 / p) * 0.92, 2))  # 8% margin
+    margin = float(os.getenv("BK_MARGIN", "0.07") or "0.07")  # 7% typical
+    # apply overround: inflate probabilities, then invert
+    o1 = 1.0 / (p1 * (1.0 + margin))
+    ox = 1.0 / (px * (1.0 + margin))
+    o2 = 1.0 / (p2 * (1.0 + margin))
 
-    return {"1": o(p1), "X": o(px), "2": o(p2)}
+    return {"1": _round_bk(o1), "X": _round_bk(ox), "2": _round_bk(o2)}
 
 def deadline_for_match(match_row: sqlite3.Row) -> Optional[datetime]:
     st = (match_row["start_time_utc"] or match_row["start_time"] or "").strip()
@@ -1123,7 +1135,7 @@ async def show_match_card(target: Message | CallbackQuery, match_id: int) -> Non
 
     user_id = target.from_user.id if target.from_user else 0  # type: ignore
     my_pick = get_my_pick(user_id, match_id) if user_id else None
-    odds = compute_live_odds(match_id) if BETTING_ENABLED else None
+    odds = compute_bk_odds(match_id) if BETTING_ENABLED else None
     bal = get_balance(user_id) if (BETTING_ENABLED and user_id) else None
 
     title = _pretty_title((match["title"] or ""), (match["sport"] or "other"))
@@ -1148,7 +1160,7 @@ async def show_match_card(target: Message | CallbackQuery, match_id: int) -> Non
         f"📊 <b>Прогнозы</b>:\n"
         f"1️⃣ {pct(stats['1'])} ({stats['1']})   🤝 {pct(stats['X'])} ({stats['X']})   2️⃣ {pct(stats['2'])} ({stats['2']})\n"
         f"🎯 Твой выбор: <b>{my_pick or '—'}</b>\n"
-        + (f"💰 Баланс: <b>{bal}</b> (ставка {BET_FIXED_STAKE})\n" if bal is not None else "")
+        + (f"💰 Баланс: <b>{bal}</b>\n" if bal is not None else "")
         + (f"📈 Коэф: 1=<b>{odds['1']}</b>  X=<b>{odds['X']}</b>  2=<b>{odds['2']}</b>\n" if odds else "")
         + f"{sep}\n\n"
         "Выбери исход 1X2:"
@@ -1192,41 +1204,146 @@ async def cb_pick(cb: CallbackQuery):
         await cb.answer(why, show_alert=True)
         return
 
-    with db() as con:
-        cur = con.cursor()
-        if BETTING_ENABLED:
-            cur.execute(
-                "INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)",
-                (cb.from_user.id, iso(now_utc()), 0),
-            )
-            r = cur.execute("SELECT balance FROM scores WHERE user_id=?", (cb.from_user.id,)).fetchone()
-            bal = int(r["balance"]) if r and r["balance"] is not None else 0
-
-            prev = cur.execute("SELECT stake FROM votes WHERE user_id=? AND match_id=?", (cb.from_user.id, match_id)).fetchone()
-            prev_stake = int(prev["stake"]) if prev and prev["stake"] is not None else 0
-            bal += prev_stake
-
-            if bal < BET_FIXED_STAKE:
-                cur.execute("UPDATE scores SET balance=? WHERE user_id=?", (bal, cb.from_user.id))
-                con.commit()
-                await cb.answer(f"❌ Не хватает баланса. Нужно {BET_FIXED_STAKE}, доступно {bal}.", show_alert=True)
-                return
-
-            odds = compute_live_odds(match_id).get(pick, 2.0)
-            bal -= BET_FIXED_STAKE
-            cur.execute("UPDATE scores SET balance=?, updated_at=? WHERE user_id=?", (bal, iso(now_utc()), cb.from_user.id))
-            cur.execute(
-                "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at, stake, odds) VALUES(?,?,?,?,?,?)",
-                (cb.from_user.id, match_id, pick, iso(now_utc()), BET_FIXED_STAKE, odds),
-            )
-        else:
-            cur.execute(
+    if not BETTING_ENABLED:
+        with db() as con:
+            con.execute(
                 "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at) VALUES(?,?,?,?)",
                 (cb.from_user.id, match_id, pick, iso(now_utc())),
             )
+            con.commit()
+        await cb.answer("✅ Принято!", show_alert=True)
+        return
+
+    # Betting: choose stake
+    odds = compute_bk_odds(match_id).get(pick, 2.0)
+    bal = get_balance(cb.from_user.id)
+    set_pref(cb.from_user.id, bet_match_id=match_id, bet_pick=pick, bet_odds=odds)
+
+    await cb.message.answer(
+        f"💸 Выбери сумму ставки\n"
+        f"Баланс: <b>{bal}</b>\n"
+        f"Исход: <b>{pick}</b> | Коэф: <b>{odds}</b>",
+        reply_markup=ikb_stake_select(match_id, pick, odds),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("stake:"))
+async def cb_stake_preset(cb: CallbackQuery):
+    upsert_user_from_message(cb)
+    try:
+        _, mid_s, pick, amt_s = cb.data.split(":")
+        match_id = int(mid_s)
+        stake = int(amt_s)
+    except Exception:
+        await cb.answer("Ошибка ставки.", show_alert=True)
+        return
+
+    if stake <= 0 or stake > BET_MAX_STAKE:
+        await cb.answer("Неверная сумма.", show_alert=True)
+        return
+
+    odds = float(get_pref(cb.from_user.id, "bet_odds", 2.0) or 2.0)
+    await _place_bet(cb.from_user.id, match_id, pick, stake, odds, cb)
+
+@dp.callback_query(F.data.startswith("stake_custom:"))
+async def cb_stake_custom(cb: CallbackQuery):
+    upsert_user_from_message(cb)
+    try:
+        _, mid_s, pick = cb.data.split(":")
+        match_id = int(mid_s)
+    except Exception:
+        await cb.answer("Ошибка.", show_alert=True)
+        return
+
+    odds = float(get_pref(cb.from_user.id, "bet_odds", 2.0) or 2.0)
+    set_pref(cb.from_user.id, awaiting_custom_stake=True, bet_match_id=match_id, bet_pick=pick, bet_odds=odds)
+    bal = get_balance(cb.from_user.id)
+    await cb.message.answer(
+        f"✍️ Введи сумму ставки числом.\nБаланс: <b>{bal}</b>\nПример: <code>300</code>",
+        reply_markup=main_menu(),
+    )
+    await cb.answer()
+
+async def _place_bet(user_id: int, match_id: int, pick: str, stake: int, odds: float, cb: CallbackQuery):
+    match = get_match(match_id)
+    if not match:
+        await cb.answer("Матч не найден.", show_alert=True)
+        return
+    ok, why = can_predict(match)
+    if not ok:
+        await cb.answer(why, show_alert=True)
+        return
+
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (user_id, iso(now_utc()), 0))
+        r = cur.execute("SELECT balance FROM scores WHERE user_id=?", (user_id,)).fetchone()
+        bal = int(r["balance"]) if r and r["balance"] is not None else 0
+
+        prev = cur.execute("SELECT stake FROM votes WHERE user_id=? AND match_id=?", (user_id, match_id)).fetchone()
+        prev_stake = int(prev["stake"]) if prev and prev["stake"] is not None else 0
+        bal += prev_stake  # refund if overwriting
+
+        if stake > bal:
+            cur.execute("UPDATE scores SET balance=?, updated_at=? WHERE user_id=?", (bal, iso(now_utc()), user_id))
+            con.commit()
+            await cb.answer(f"❌ Не хватает баланса. Доступно {bal}.", show_alert=True)
+            return
+
+        bal -= stake
+        cur.execute("UPDATE scores SET balance=?, updated_at=? WHERE user_id=?", (bal, iso(now_utc()), user_id))
+        cur.execute(
+            "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at, stake, odds) VALUES(?,?,?,?,?,?)",
+            (user_id, match_id, pick, iso(now_utc()), stake, odds),
+        )
         con.commit()
 
-        await cb.answer("✅ Принято!", show_alert=True)
+    await cb.message.answer(
+        f"✅ Ставка принята!\n"
+        f"Матч: <b>{_pretty_title(match['title'] or '', match['sport'] or 'other')}</b>\n"
+        f"Исход: <b>{pick}</b> | Коэф: <b>{odds}</b>\n"
+        f"Сумма: <b>{stake}</b>\n"
+        f"Баланс: <b>{bal}</b>",
+        reply_markup=main_menu(),
+    )
+    await cb.answer()
+
+@dp.message(lambda m: bool(getattr(m, "text", None)) and m.from_user and get_pref(m.from_user.id, "awaiting_custom_stake", False))
+async def custom_stake_handler(m: Message):
+    upsert_user_from_message(m)
+    uid = m.from_user.id
+    raw = (m.text or "").strip()
+
+    clear_pref(uid, "awaiting_custom_stake")
+
+    try:
+        stake = int(raw)
+    except Exception:
+        await m.answer("Нужно целое число (пример: 300).", reply_markup=main_menu())
+        return
+
+    if stake <= 0 or stake > BET_MAX_STAKE:
+        await m.answer("Неверная сумма.", reply_markup=main_menu())
+        return
+
+    match_id = int(get_pref(uid, "bet_match_id", 0) or 0)
+    pick = str(get_pref(uid, "bet_pick", "") or "")
+    odds = float(get_pref(uid, "bet_odds", 2.0) or 2.0)
+
+    if not match_id or pick not in ("1", "X", "2"):
+        await m.answer("Ставка отменена.", reply_markup=main_menu())
+        return
+
+    # reuse placement logic without CallbackQuery
+    class _DummyCB:
+        def __init__(self, message: Message):
+            self.message = message
+        async def answer(self, *args, **kwargs):
+            return
+
+    dummy = _DummyCB(m)
+    await _place_bet(uid, match_id, pick, stake, odds, dummy)  # type: ignore
 
 @dp.message(F.text == BTN_FIND_MATCH)
 async def find_match(m: Message):
