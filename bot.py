@@ -1,14 +1,34 @@
 # -*- coding: utf-8 -*-
 """
 Predictor Bot (aiogram v3.7+)
-- Sporty UI (titles, league, time blocks)
-- Active matches -> day filter -> sport -> list (pagination) -> match card
-- Search match by text (team/part of title)
-- 1X2 only
-- Deadline: PREDICT_DEADLINE_MIN minutes before start
-- Autosync: football-data.org + NHL
-- Auto-results with scoring
-- Render Web Service health server on 0.0.0.0:$PORT
+
+UI
+- Главное меню (кнопки)
+- ⚡ Активные матчи -> выбор спорта -> список матчей (пагинация) -> карточка матча
+- 🔎 Поиск матча по названию/командам
+- 🔖 Короткий код матча (ABC-DEF • HH:MM)
+
+Функции
+- Только 1X2
+- Дедлайн прогнозов: PREDICT_DEADLINE_MIN минут до старта
+- Автосинк матчей: football-data.org + NHL
+- Авто-итоги и начисление очков
+- Профиль + лидерборд
+- Keep-alive (Render free): пинг public /health если задан KEEP_ALIVE_URL
+- Render health server на 0.0.0.0:$PORT (если PORT задан)
+
+ENV
+- BOT_TOKEN (required)
+- ADMIN_ID (optional)
+- PORT (Render sets; if you deploy as Web Service)
+- KEEP_ALIVE_URL (optional, e.g. https://<service>.onrender.com/health)
+- KEEP_ALIVE_INTERVAL=300
+- PREDICT_DEADLINE_MIN=5
+- SYNC_ENABLED=1, SYNC_INTERVAL=3600, SYNC_LOOKAHEAD_DAYS=1
+- FOOTBALL_ENABLED=1, FOOTBALL_DATA_TOKEN=..., FOOTBALL_COMPETITIONS=PL,CL,PD,SA,BL1,FL1
+- NHL_ENABLED=1
+- AUTO_RESULTS_ENABLED=1, AUTO_RESULTS_INTERVAL=300, AUTO_RESULTS_MIN_AGE_MIN=20
+- POINTS_FOR_CORRECT=3, POINTS_FOR_WRONG=0
 """
 
 from __future__ import annotations
@@ -20,7 +40,6 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -51,6 +70,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 PORT = int(os.getenv("PORT", "0") or "0")
 
+KEEP_ALIVE_URL = (os.getenv("KEEP_ALIVE_URL") or "").strip()
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "300") or "300")
+
 PREDICT_DEADLINE_MIN = int(os.getenv("PREDICT_DEADLINE_MIN", "5") or "5")
 
 SYNC_ENABLED = os.getenv("SYNC_ENABLED", "1") == "1"
@@ -59,7 +81,11 @@ SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", "1") or "1")
 
 FOOTBALL_ENABLED = os.getenv("FOOTBALL_ENABLED", "1") == "1"
 FOOTBALL_DATA_TOKEN = (os.getenv("FOOTBALL_DATA_TOKEN") or "").strip()
-FOOTBALL_COMPETITIONS = [c.strip() for c in (os.getenv("FOOTBALL_COMPETITIONS") or "PL,CL,PD,SA,BL1,FL1").split(",") if c.strip()]
+FOOTBALL_COMPETITIONS = [
+    c.strip()
+    for c in (os.getenv("FOOTBALL_COMPETITIONS") or "PL,CL,PD,SA,BL1,FL1").split(",")
+    if c.strip()
+]
 FOOTBALL_BASE = (os.getenv("FOOTBALL_BASE") or "https://api.football-data.org/v4").rstrip("/")
 
 NHL_ENABLED = os.getenv("NHL_ENABLED", "1") == "1"
@@ -107,11 +133,6 @@ def db() -> sqlite3.Connection:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-MOSCOW_TZ = ZoneInfo('Europe/Moscow')
-
-def now_msk() -> datetime:
-    return datetime.now(MOSCOW_TZ)
 
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
@@ -250,7 +271,6 @@ SPORT_PRETTY = {
 }
 
 PER_PAGE = 10
-
 RU_MON = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
 
 def _sport_emoji(sport: str) -> str:
@@ -307,18 +327,6 @@ def main_menu() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
-def ikb_day_filter(current: str = "all") -> InlineKeyboardMarkup:
-    cur = (current or "all").lower()
-    def mark(lbl: str, key: str) -> str:
-        return f"✅ {lbl}" if cur == key else lbl
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=mark("📅 Сегодня", "today"), callback_data="day:today"),
-            InlineKeyboardButton(text=mark("📅 Завтра", "tomorrow"), callback_data="day:tomorrow"),
-            InlineKeyboardButton(text=mark("🗂 Все даты", "all"), callback_data="day:all"),
-        ]
-    ])
-
 def ikb_sports(sports: List[Tuple[str, int]]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     for sport, cnt in sports:
@@ -345,6 +353,7 @@ def ikb_matches_list(sport: str, page: int, items: List[sqlite3.Row], total: int
     if page < max_page:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"sport:{sport}:{page+1}"))
     rows.append(nav)
+
     rows.append([InlineKeyboardButton(text="⬅️ Назад к видам спорта", callback_data="back:sports")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -373,15 +382,6 @@ def get_open_sports() -> List[Tuple[str, int]]:
             ORDER BY c DESC
         """).fetchall()
     return [(r["sport"], int(r["c"])) for r in rows]
-
-def _day_bounds(day_filter: str) -> Tuple[Optional[str], Optional[str]]:
-    df = (day_filter or "all").lower()
-    if df not in ("today", "tomorrow"):
-        return None, None
-    base = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
-    if df == "tomorrow":
-        base = base + timedelta(days=1)
-    return iso(base), iso(base + timedelta(days=1))
 
 def count_open_matches(sport: str) -> int:
     with db() as con:
@@ -783,11 +783,28 @@ async def auto_results_loop():
             except Exception as e:
                 logger.exception("auto_results_loop error: %s", e)
 
+async def keep_alive_loop():
+    """Keep Render free Web Service from spinning down.
+    Set KEEP_ALIVE_URL to your public /health URL and it will ping it periodically.
+    """
+    if not KEEP_ALIVE_URL:
+        return
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(KEEP_ALIVE_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    await resp.text()
+                logger.debug("keep-alive ping ok")
+            except Exception as e:
+                logger.warning("keep-alive ping failed: %s", e)
+            await asyncio.sleep(max(60, KEEP_ALIVE_INTERVAL))
+
 # =========================
 # WEB SERVER (Render)
 # =========================
 
 async def start_web_server():
+    # If you deploy as Render Web Service, PORT must be bound.
     if PORT <= 0:
         return
 
@@ -815,7 +832,7 @@ async def start_web_server():
 async def cmd_start(m: Message):
     upsert_user_from_message(m)
     text_msg = (
-        "👋 Привет!\n\n"
+        "👋 <b>Привет!</b>\n\n"
         "Это бот прогнозов <b>1X2</b>.\n"
         "Жми <b>⚡ Активные матчи</b> → выбери спорт → матч.\n\n"
         f"⏱ Дедлайн: за <b>{PREDICT_DEADLINE_MIN}</b> мин до старта."
@@ -838,7 +855,7 @@ async def help_btn(m: Message):
 @dp.message(Command("sync_now"))
 async def sync_cmd(m: Message):
     upsert_user_from_message(m)
-    if not is_admin(m.from_user.id):
+    if not m.from_user or not is_admin(m.from_user.id):
         return
     msg = await autosync_once()
     pick_featured_for_today()
@@ -853,7 +870,6 @@ async def active_matches(m: Message):
         return
     await m.answer("⚡ <b>Активные матчи</b>\n\nВыбери вид спорта 👇", reply_markup=main_menu())
     await m.answer("Категории:", reply_markup=ikb_sports(sports))
-
 
 @dp.callback_query(F.data.startswith("sport:"))
 async def cb_sport(cb: CallbackQuery):
@@ -898,7 +914,6 @@ async def cb_sport(cb: CallbackQuery):
 @dp.callback_query(F.data == "back:sports")
 async def cb_back_sports(cb: CallbackQuery):
     upsert_user_from_message(cb)
-    df = get_pref(cb.from_user.id, "day_filter", "all")
     sports = get_open_sports()
     if not sports:
         await cb.answer("Матчей нет.", show_alert=True)
@@ -1026,20 +1041,19 @@ async def cb_pick(cb: CallbackQuery):
 @dp.message(F.text == BTN_FIND_MATCH)
 async def find_match(m: Message):
     upsert_user_from_message(m)
+    if not m.from_user:
+        return
     set_pref(m.from_user.id, awaiting_match_search=True)
     await m.answer(
         "🔎 Напиши команду/часть названия (пример: <code>arsenal</code> или <code>real</code>):",
         reply_markup=main_menu(),
     )
 
-@dp.message()
+# IMPORTANT: This handler MUST NOT match every message, иначе ломает кнопки.
+@dp.message(lambda m: bool(getattr(m, "text", None)) and m.from_user and get_pref(m.from_user.id, "awaiting_match_search", False))
 async def catch_text(m: Message):
-    if not m.text or not m.from_user:
-        return
-    if not get_pref(m.from_user.id, "awaiting_match_search", False):
-        return
-
-    q = m.text.strip()
+    # filter guarantees: text + from_user + awaiting flag
+    q = (m.text or "").strip()
     clear_pref(m.from_user.id, "awaiting_match_search")
 
     if len(q) < 2:
@@ -1080,6 +1094,8 @@ async def catch_text(m: Message):
 @dp.message(F.text == BTN_MY)
 async def my_predictions(m: Message):
     upsert_user_from_message(m)
+    if not m.from_user:
+        return
     with db() as con:
         rows = con.execute("""
             SELECT v.match_id, v.pick, v.created_at, m.title, m.status, m.result, m.sport
@@ -1168,6 +1184,8 @@ def get_score_row(user_id: int) -> sqlite3.Row:
 @dp.message(F.text == BTN_PROFILE)
 async def profile(m: Message):
     upsert_user_from_message(m)
+    if not m.from_user:
+        return
     s = get_score_row(m.from_user.id)
     await m.answer(
         "👤 <b>Профиль</b>\n\n"
@@ -1184,12 +1202,19 @@ async def profile(m: Message):
 
 async def main():
     init_db()
+
+    # For Render Web Service: keep port open (health endpoint)
     asyncio.create_task(start_web_server())
+
+    # Keep-alive ping (only if KEEP_ALIVE_URL is set)
+    asyncio.create_task(keep_alive_loop())
+
     if SYNC_ENABLED:
         asyncio.create_task(autosync_loop())
     if AUTO_RESULTS_ENABLED:
         asyncio.create_task(auto_results_loop())
 
+    # Restart polling if it crashes (common on flaky hosting)
     while True:
         try:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
