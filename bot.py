@@ -204,15 +204,15 @@ def init_db() -> None:
         )
         """)
 
+        for stmt in [
+            "ALTER TABLE votes ADD COLUMN stake INTEGER",
+            "ALTER TABLE votes ADD COLUMN odds REAL",
+        ]:
+            try:
+                cur.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
 
-for stmt in [
-    "ALTER TABLE votes ADD COLUMN stake INTEGER",
-    "ALTER TABLE votes ADD COLUMN odds REAL",
-]:
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS scores (
             user_id INTEGER PRIMARY KEY,
@@ -221,16 +221,10 @@ for stmt in [
             total INTEGER DEFAULT 0,
             streak INTEGER DEFAULT 0,
             best_streak INTEGER DEFAULT 0,
+            balance INTEGER DEFAULT 0,
             updated_at TEXT
         )
         """)
-for stmt in [
-    "ALTER TABLE scores ADD COLUMN balance INTEGER DEFAULT 0",
-]:
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
 
 
         cur.execute("""
