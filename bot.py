@@ -98,15 +98,18 @@ AUTO_RESULTS_MIN_AGE_MIN = int(os.getenv("AUTO_RESULTS_MIN_AGE_MIN", "20") or "2
 POINTS_FOR_CORRECT = int(os.getenv("POINTS_FOR_CORRECT", "3") or "3")
 POINTS_FOR_WRONG = int(os.getenv("POINTS_FOR_WRONG", "0") or "0")
 
-# Betting / bankroll
+# Betting / bankroll (simple fixed stake)
 BETTING_ENABLED = os.getenv("BETTING_ENABLED", "1") == "1"
+BET_FIXED_STAKE = int(os.getenv("BET_FIXED_STAKE", "100") or "100")  # stake per prediction
 WEEKLY_BONUS_ENABLED = os.getenv("WEEKLY_BONUS_ENABLED", "1") == "1"
 WEEKLY_BONUS_AMOUNT = int(os.getenv("WEEKLY_BONUS_AMOUNT", "1000") or "1000")
+
 DISPLAY_TZ = os.getenv("DISPLAY_TZ", "Europe/Moscow")
 try:
     DISPLAY_ZONE = ZoneInfo(DISPLAY_TZ)
 except Exception:
     DISPLAY_ZONE = ZoneInfo("Europe/Moscow")
+
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
@@ -184,10 +187,7 @@ def init_db() -> None:
             "ALTER TABLE matches ADD COLUMN external_id TEXT",
             "ALTER TABLE matches ADD COLUMN start_time_utc TEXT",
             "ALTER TABLE matches ADD COLUMN created_at TEXT",
-                    "ALTER TABLE matches ADD COLUMN odds_1 REAL",
-            "ALTER TABLE matches ADD COLUMN odds_x REAL",
-            "ALTER TABLE matches ADD COLUMN odds_2 REAL",
-]:
+        ]:
             try:
                 cur.execute(stmt)
             except sqlite3.OperationalError:
@@ -200,6 +200,8 @@ def init_db() -> None:
             match_id INTEGER,
             pick TEXT,
             created_at TEXT,
+            stake INTEGER,
+            odds REAL,
             UNIQUE(user_id, match_id)
         )
         """)
@@ -217,15 +219,22 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS scores (
             user_id INTEGER PRIMARY KEY,
             points INTEGER DEFAULT 0,
+            balance INTEGER DEFAULT 0,
             correct INTEGER DEFAULT 0,
             total INTEGER DEFAULT 0,
             streak INTEGER DEFAULT 0,
             best_streak INTEGER DEFAULT 0,
-            balance INTEGER DEFAULT 0,
             updated_at TEXT
         )
         """)
 
+        for stmt in [
+            "ALTER TABLE scores ADD COLUMN balance INTEGER DEFAULT 0",
+        ]:
+            try:
+                cur.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS points_log (
@@ -393,7 +402,6 @@ def ikb_match_card(match_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=bx, callback_data=f"pick:{match_id}:X"),
             InlineKeyboardButton(text=b2, callback_data=f"pick:{match_id}:2"),
         ],
-
         [InlineKeyboardButton(text="📊 Голоса", callback_data=f"stats:{match_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:sports")],
     ])
@@ -462,6 +470,29 @@ def match_stats(match_id: int) -> Dict[str, int]:
         if p in counts:
             counts[p] += int(r["c"])
     return counts
+
+
+def get_balance(user_id: int) -> int:
+    s = get_score_row(user_id)
+    try:
+        return int(s["balance"])
+    except Exception:
+        return 0
+
+def compute_live_odds(match_id: int) -> Dict[str, float]:
+    """Simple crowd-based odds."""
+    s = match_stats(match_id)
+    c1 = s["1"] + 1
+    cx = s["X"] + 1
+    c2 = s["2"] + 1
+    denom = c1 + cx + c2
+    p1, px, p2 = c1 / denom, cx / denom, c2 / denom
+
+    def o(p: float) -> float:
+        p = max(0.05, min(0.95, p))
+        return max(1.15, round((1.0 / p) * 0.92, 2))  # 8% margin
+
+    return {"1": o(p1), "X": o(px), "2": o(p2)}
 
 def deadline_for_match(match_row: sqlite3.Row) -> Optional[datetime]:
     st = (match_row["start_time_utc"] or match_row["start_time"] or "").strip()
@@ -703,125 +734,112 @@ def pick_featured_for_today() -> Optional[int]:
         con.commit()
         return mid
 
-    async def apply_scoring_for_match(match_id: int, result_1x2: str) -> None:
-        with db() as con:
-            cur = con.cursor()
-            st = cur.execute("SELECT status FROM matches WHERE id=?", (match_id,)).fetchone()
-            if not st or st["status"] != "open":
-                return
+async def apply_scoring_for_match(match_id: int, result_1x2: str) -> None:
+    with db() as con:
+        cur = con.cursor()
+        st = cur.execute("SELECT status FROM matches WHERE id=?", (match_id,)).fetchone()
+        if not st or st["status"] != "open":
+            return
 
-            cur.execute("UPDATE matches SET result=?, status='closed' WHERE id=?", (result_1x2, match_id))
+        cur.execute("UPDATE matches SET result=?, status='closed' WHERE id=?", (result_1x2, match_id))
 
-            votes = cur.execute("SELECT user_id, pick, stake, odds FROM votes WHERE match_id=?", (match_id,)).fetchall()
-            for v in votes:
-                uid = int(v["user_id"])
-                pick = v["pick"]
-                stake = int(v["stake"]) if v["stake"] is not None else 0
-                odds = float(v["odds"]) if v["odds"] is not None else 0.0
-
-                correct = (pick == result_1x2)
-                delta_points = POINTS_FOR_CORRECT if correct else POINTS_FOR_WRONG
-
-                cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
-
-                # points/streak
-                if correct:
-                    cur.execute(
-                        """
-                        UPDATE scores
-                        SET points = points + ?,
-                            correct = correct + 1,
-                            total = total + 1,
-                            streak = streak + 1,
-                            best_streak = CASE WHEN streak + 1 > best_streak THEN streak + 1 ELSE best_streak END,
-                            updated_at = ?
-                        WHERE user_id=?
-                        """,
-                        (delta_points, iso(now_utc()), uid),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        UPDATE scores
-                        SET points = points + ?,
-                            total = total + 1,
-                            streak = 0,
-                            updated_at = ?
-                        WHERE user_id=?
-                        """,
-                        (delta_points, iso(now_utc()), uid),
-                    )
-
-                if delta_points != 0:
-                    cur.execute(
-                        "INSERT INTO points_log(user_id, match_id, points, created_at) VALUES(?,?,?,?)",
-                        (uid, match_id, delta_points, iso(now_utc())),
-                    )
-
-                # betting settlement
-                win_amount = 0
-                net_profit = 0
-                if BETTING_ENABLED and stake > 0 and odds > 0:
-                    if correct:
-                        win_amount = int(round(stake * odds))
-                        net_profit = win_amount - stake
-                        cur.execute("UPDATE scores SET balance = balance + ? WHERE user_id=?", (win_amount, uid))
-                    else:
-                        net_profit = -stake
-
-            con.commit()
-
-        # Notify users (outside transaction)
-        try:
-            match = get_match(match_id)
-            title = _pretty_title((match["title"] or ""), (match["sport"] or "other")) if match else f"Матч #{match_id}"
-        except Exception:
-            title = f"Матч #{match_id}"
-
+        votes = cur.execute("SELECT user_id, pick, stake, odds FROM votes WHERE match_id=?", (match_id,)).fetchall()
         for v in votes:
-            try:
-                uid = int(v["user_id"])
-                pick = v["pick"]
-                stake = int(v["stake"]) if v["stake"] is not None else 0
-                odds = float(v["odds"]) if v["odds"] is not None else 0.0
-                correct = (pick == result_1x2)
+            uid = int(v["user_id"])
+            pick = v["pick"]
+            stake = int(v["stake"]) if v["stake"] is not None else 0
+            odds = float(v["odds"]) if v["odds"] is not None else 0.0
 
-                # fetch new balance
-                with db() as con:
-                    r = con.execute("SELECT balance, points FROM scores WHERE user_id=?", (uid,)).fetchone()
-                bal = int(r["balance"]) if r and r["balance"] is not None else 0
+            correct = (pick == result_1x2)
+            delta = POINTS_FOR_CORRECT if correct else POINTS_FOR_WRONG
 
-                if BETTING_ENABLED and stake > 0 and odds > 0:
-                    if correct:
-                        win_amount = int(round(stake * odds))
-                        profit = win_amount - stake
-                        await bot.send_message(
-                            uid,
-                            f"✅ <b>Результат матча</b>\n{title}\n\n"
-                            f"Итог: <b>{result_1x2}</b>\n"
-                            f"Твой прогноз: <b>{pick}</b>\n\n"
-                            f"💰 Ты выиграл: <b>{win_amount}</b> (профит {profit:+d})\n"
-                            f"Баланс: <b>{bal}</b>",
-                        )
-                    else:
-                        await bot.send_message(
-                            uid,
-                            f"❌ <b>Результат матча</b>\n{title}\n\n"
-                            f"Итог: <b>{result_1x2}</b>\n"
-                            f"Твой прогноз: <b>{pick}</b>\n\n"
-                            f"💸 Ты проиграл: <b>{stake}</b>\n"
-                            f"Баланс: <b>{bal}</b>",
-                        )
-                else:
-                    # points-only notification (optional)
+            cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
+
+            if correct:
+                cur.execute(
+                    """
+                    UPDATE scores
+                    SET points = points + ?,
+                        correct = correct + 1,
+                        total = total + 1,
+                        streak = streak + 1,
+                        best_streak = CASE WHEN streak + 1 > best_streak THEN streak + 1 ELSE best_streak END,
+                        updated_at = ?
+                    WHERE user_id=?
+                    """,
+                    (delta, iso(now_utc()), uid),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE scores
+                    SET points = points + ?,
+                        total = total + 1,
+                        streak = 0,
+                        updated_at = ?
+                    WHERE user_id=?
+                    """,
+                    (delta, iso(now_utc()), uid),
+                )
+
+            if delta != 0:
+                cur.execute(
+                    "INSERT INTO points_log(user_id, match_id, points, created_at) VALUES(?,?,?,?)",
+                    (uid, match_id, delta, iso(now_utc())),
+                )
+
+            if BETTING_ENABLED and stake > 0 and odds > 0 and correct:
+                win_amount = int(round(stake * odds))
+                cur.execute("UPDATE scores SET balance = balance + ? WHERE user_id=?", (win_amount, uid))
+
+        con.commit()
+
+    # notify
+    match = get_match(match_id)
+    title = _pretty_title((match["title"] or ""), (match["sport"] or "other")) if match else f"Матч #{match_id}"
+
+    for v in votes:
+        try:
+            uid = int(v["user_id"])
+            pick = v["pick"]
+            stake = int(v["stake"]) if v["stake"] is not None else 0
+            odds = float(v["odds"]) if v["odds"] is not None else 0.0
+            correct = (pick == result_1x2)
+
+            with db() as con:
+                r = con.execute("SELECT balance FROM scores WHERE user_id=?", (uid,)).fetchone()
+            bal = int(r["balance"]) if r and r["balance"] is not None else 0
+
+            if BETTING_ENABLED and stake > 0 and odds > 0:
+                if correct:
+                    win_amount = int(round(stake * odds))
+                    profit = win_amount - stake
                     await bot.send_message(
                         uid,
-                        f"🏁 Матч завершён\n{title}\n"
+                        f"✅ <b>Результат матча</b>\n{title}\n\n"
                         f"Итог: <b>{result_1x2}</b>\n"
-                        f"Твой прогноз: <b>{pick}</b>",
+                        f"Твой прогноз: <b>{pick}</b>\n\n"
+                        f"💰 Выигрыш: <b>{win_amount}</b> (профит {profit:+d})\n"
+                        f"Баланс: <b>{bal}</b>",
                     )
-            except Exception:
-                pass
+                else:
+                    await bot.send_message(
+                        uid,
+                        f"❌ <b>Результат матча</b>\n{title}\n\n"
+                        f"Итог: <b>{result_1x2}</b>\n"
+                        f"Твой прогноз: <b>{pick}</b>\n\n"
+                        f"💸 Проигрыш: <b>{stake}</b>\n"
+                        f"Баланс: <b>{bal}</b>",
+                    )
+            else:
+                await bot.send_message(
+                    uid,
+                    f"🏁 Матч завершён\n{title}\n"
+                    f"Итог: <b>{result_1x2}</b>\n"
+                    f"Твой прогноз: <b>{pick}</b>",
+                )
+        except Exception:
+            pass
 
 async def autosync_loop():
     while True:
@@ -889,48 +907,40 @@ async def auto_results_loop():
                 logger.exception("auto_results_loop error: %s", e)
 
 
-    def next_weekly_bonus_run(now: datetime) -> datetime:
-        """Next Monday 12:00 in DISPLAY_ZONE."""
-        local = now.astimezone(DISPLAY_ZONE)
-        # Monday=0
-        days_ahead = (0 - local.weekday()) % 7
-        target = local.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
-        if target <= local:
-            target = target + timedelta(days=7)
-        return target.astimezone(timezone.utc)
+def next_weekly_bonus_run(now: datetime) -> datetime:
+    local = now.astimezone(DISPLAY_ZONE)
+    days_ahead = (0 - local.weekday()) % 7
+    target = local.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    if target <= local:
+        target = target + timedelta(days=7)
+    return target.astimezone(timezone.utc)
 
-    async def weekly_bonus_loop():
-        if not WEEKLY_BONUS_ENABLED:
-            return
-        while True:
-            try:
-                run_at = next_weekly_bonus_run(now_utc())
-                sleep_s = max(5, int((run_at - now_utc()).total_seconds()))
-                await asyncio.sleep(sleep_s)
+async def weekly_bonus_loop():
+    if not WEEKLY_BONUS_ENABLED:
+        return
+    while True:
+        try:
+            run_at = next_weekly_bonus_run(now_utc())
+            sleep_s = max(5, int((run_at - now_utc()).total_seconds()))
+            await asyncio.sleep(sleep_s)
 
-                # award
-                with db() as con:
-                    cur = con.cursor()
-                    user_rows = cur.execute("SELECT user_id FROM users").fetchall()
-                    uids = [int(r["user_id"]) for r in user_rows]
-                    for uid in uids:
-                        cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
-                    cur.execute("UPDATE scores SET balance = COALESCE(balance,0) + ?, updated_at=?", (WEEKLY_BONUS_AMOUNT, iso(now_utc())))
-                    con.commit()
-
-                # notify
+            with db() as con:
+                cur = con.cursor()
+                user_rows = cur.execute("SELECT user_id FROM users").fetchall()
+                uids = [int(r["user_id"]) for r in user_rows]
                 for uid in uids:
-                    try:
-                        await bot.send_message(
-                            uid,
-                            f"🎁 Еженедельный бонус: +<b>{WEEKLY_BONUS_AMOUNT}</b> баллов!\n"
-                            f"Выдан в понедельник 12:00 по МСК.",
-                        )
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.exception("weekly_bonus_loop error: %s", e)
-                await asyncio.sleep(60)
+                    cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
+                cur.execute("UPDATE scores SET balance = COALESCE(balance,0) + ?, updated_at=?", (WEEKLY_BONUS_AMOUNT, iso(now_utc())))
+                con.commit()
+
+            for uid in uids:
+                try:
+                    await bot.send_message(uid, f"🎁 Еженедельный бонус: +<b>{WEEKLY_BONUS_AMOUNT}</b> баллов!\nВыдан в понедельник 12:00 по МСК.")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception("weekly_bonus_loop error: %s", e)
+            await asyncio.sleep(60)
 
 async def keep_alive_loop():
     """Keep Render free Web Service from spinning down.
@@ -1138,7 +1148,7 @@ async def show_match_card(target: Message | CallbackQuery, match_id: int) -> Non
         f"📊 <b>Прогнозы</b>:\n"
         f"1️⃣ {pct(stats['1'])} ({stats['1']})   🤝 {pct(stats['X'])} ({stats['X']})   2️⃣ {pct(stats['2'])} ({stats['2']})\n"
         f"🎯 Твой выбор: <b>{my_pick or '—'}</b>\n"
-        + (f"💰 Баланс: <b>{bal}</b>\n" if bal is not None else "")
+        + (f"💰 Баланс: <b>{bal}</b> (ставка {BET_FIXED_STAKE})\n" if bal is not None else "")
         + (f"📈 Коэф: 1=<b>{odds['1']}</b>  X=<b>{odds['X']}</b>  2=<b>{odds['2']}</b>\n" if odds else "")
         + f"{sep}\n\n"
         "Выбери исход 1X2:"
@@ -1159,51 +1169,64 @@ async def cb_stats(cb: CallbackQuery):
     s = match_stats(match_id)
     await cb.answer(f"1={s['1']}  X={s['X']}  2={s['2']}", show_alert=True)
 
-    @dp.callback_query(F.data.startswith("pick:"))
-    async def cb_pick(cb: CallbackQuery):
-        upsert_user_from_message(cb)
-        try:
-            _, match_id_s, pick = cb.data.split(":")
-            match_id = int(match_id_s)
-        except Exception:
-            await cb.answer("Ошибка.", show_alert=True)
-            return
-        if pick not in ("1", "X", "2"):
-            await cb.answer("Неверный исход.", show_alert=True)
-            return
+@dp.callback_query(F.data.startswith("pick:"))
+async def cb_pick(cb: CallbackQuery):
+    upsert_user_from_message(cb)
+    try:
+        _, match_id_s, pick = cb.data.split(":")
+        match_id = int(match_id_s)
+    except Exception:
+        await cb.answer("Ошибка.", show_alert=True)
+        return
+    if pick not in ("1", "X", "2"):
+        await cb.answer("Неверный исход.", show_alert=True)
+        return
 
-        match = get_match(match_id)
-        if not match:
-            await cb.answer("Матч не найден.", show_alert=True)
-            return
+    match = get_match(match_id)
+    if not match:
+        await cb.answer("Матч не найден.", show_alert=True)
+        return
 
-        ok, why = can_predict(match)
-        if not ok:
-            await cb.answer(why, show_alert=True)
-            return
+    ok, why = can_predict(match)
+    if not ok:
+        await cb.answer(why, show_alert=True)
+        return
 
-        if not BETTING_ENABLED:
-            with db() as con:
-                con.execute(
-                    "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at) VALUES(?,?,?,?)",
-                    (cb.from_user.id, match_id, pick, iso(now_utc())),
-                )
+    with db() as con:
+        cur = con.cursor()
+        if BETTING_ENABLED:
+            cur.execute(
+                "INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)",
+                (cb.from_user.id, iso(now_utc()), 0),
+            )
+            r = cur.execute("SELECT balance FROM scores WHERE user_id=?", (cb.from_user.id,)).fetchone()
+            bal = int(r["balance"]) if r and r["balance"] is not None else 0
+
+            prev = cur.execute("SELECT stake FROM votes WHERE user_id=? AND match_id=?", (cb.from_user.id, match_id)).fetchone()
+            prev_stake = int(prev["stake"]) if prev and prev["stake"] is not None else 0
+            bal += prev_stake
+
+            if bal < BET_FIXED_STAKE:
+                cur.execute("UPDATE scores SET balance=? WHERE user_id=?", (bal, cb.from_user.id))
                 con.commit()
-            await cb.answer("✅ Принято!", show_alert=True)
-            return
+                await cb.answer(f"❌ Не хватает баланса. Нужно {BET_FIXED_STAKE}, доступно {bal}.", show_alert=True)
+                return
 
-        # Betting flow: ask stake
-        odds = compute_live_odds(match_id)
-        set_pref(cb.from_user.id, awaiting_stake=True, bet_match_id=match_id, bet_pick=pick, bet_odds=odds.get(pick, 2.0))
-        bal = get_balance(cb.from_user.id)
-        await cb.message.answer(
-            f"💸 Введи сумму ставки (целое число).\n"
-            f"Текущий баланс: <b>{bal}</b>\n"
-            f"Твой исход: <b>{pick}</b> | Коэффициент: <b>{odds.get(pick, 2.0)}</b>\n\n"
-            f"Пример: <code>200</code>",
-            reply_markup=main_menu(),
-        )
-        await cb.answer()
+            odds = compute_live_odds(match_id).get(pick, 2.0)
+            bal -= BET_FIXED_STAKE
+            cur.execute("UPDATE scores SET balance=?, updated_at=? WHERE user_id=?", (bal, iso(now_utc()), cb.from_user.id))
+            cur.execute(
+                "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at, stake, odds) VALUES(?,?,?,?,?,?)",
+                (cb.from_user.id, match_id, pick, iso(now_utc()), BET_FIXED_STAKE, odds),
+            )
+        else:
+            cur.execute(
+                "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at) VALUES(?,?,?,?)",
+                (cb.from_user.id, match_id, pick, iso(now_utc())),
+            )
+        con.commit()
+
+        await cb.answer("✅ Принято!", show_alert=True)
 
 @dp.message(F.text == BTN_FIND_MATCH)
 async def find_match(m: Message):
@@ -1215,84 +1238,6 @@ async def find_match(m: Message):
         "🔎 Напиши команду/часть названия (пример: <code>arsenal</code> или <code>real</code>):",
         reply_markup=main_menu(),
     )
-
-
-    @dp.message(lambda m: bool(getattr(m, "text", None)) and m.from_user and get_pref(m.from_user.id, "awaiting_stake", False))
-    async def stake_amount_handler(m: Message):
-        upsert_user_from_message(m)
-        uid = m.from_user.id
-        raw = (m.text or "").strip()
-
-        # clear flag first to avoid trapping user
-        clear_pref(uid, "awaiting_stake")
-
-        match_id = int(get_pref(uid, "bet_match_id", 0) or 0)
-        pick = str(get_pref(uid, "bet_pick", "") or "")
-        odds = float(get_pref(uid, "bet_odds", 2.0) or 2.0)
-
-        # cleanup
-        clear_pref(uid, "bet_match_id")
-        clear_pref(uid, "bet_pick")
-        clear_pref(uid, "bet_odds")
-
-        if not match_id or pick not in ("1", "X", "2"):
-            await m.answer("Ставка отменена.", reply_markup=main_menu())
-            return
-
-        match = get_match(match_id)
-        if not match:
-            await m.answer("Матч не найден.", reply_markup=main_menu())
-            return
-
-        ok, why = can_predict(match)
-        if not ok:
-            await m.answer(why, reply_markup=main_menu())
-            return
-
-        try:
-            stake = int(raw)
-        except Exception:
-            await m.answer("Нужно целое число (пример: 200).", reply_markup=main_menu())
-            return
-
-        if stake <= 0:
-            await m.answer("Ставка должна быть > 0.", reply_markup=main_menu())
-            return
-
-        # handle overwrite: refund previous stake if exists
-        with db() as con:
-            cur = con.cursor()
-            cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at, balance) VALUES(?,?,?)", (uid, iso(now_utc()), 0))
-            prev = cur.execute("SELECT stake FROM votes WHERE user_id=? AND match_id=?", (uid, match_id)).fetchone()
-            prev_stake = int(prev["stake"]) if prev and prev["stake"] is not None else 0
-
-            bal = cur.execute("SELECT balance FROM scores WHERE user_id=?", (uid,)).fetchone()
-            balance = int(bal["balance"]) if bal and bal["balance"] is not None else 0
-
-            # refund previous stake (if any) before taking new stake
-            balance += prev_stake
-
-            if stake > balance:
-                await m.answer(f"Недостаточно средств. Доступно: <b>{balance}</b>", reply_markup=main_menu())
-                return
-
-            balance -= stake
-
-            cur.execute("UPDATE scores SET balance=?, updated_at=? WHERE user_id=?", (balance, iso(now_utc()), uid))
-            cur.execute(
-                "INSERT OR REPLACE INTO votes(user_id, match_id, pick, created_at, stake, odds) VALUES(?,?,?,?,?,?)",
-                (uid, match_id, pick, iso(now_utc()), stake, odds),
-            )
-            con.commit()
-
-        await m.answer(
-            f"✅ Ставка принята!\n"
-            f"Исход: <b>{pick}</b>\n"
-            f"Сумма: <b>{stake}</b>\n"
-            f"Коэффициент: <b>{odds}</b>\n"
-            f"Баланс: <b>{balance}</b>",
-            reply_markup=main_menu(),
-        )
 
 # IMPORTANT: This handler MUST NOT match every message, иначе ломает кнопки.
 @dp.message(lambda m: bool(getattr(m, "text", None)) and m.from_user and get_pref(m.from_user.id, "awaiting_match_search", False))
@@ -1417,40 +1362,6 @@ async def leaderboard(m: Message):
     )
     await m.answer(text_msg, reply_markup=main_menu())
 
-
-def get_balance(user_id: int) -> int:
-    s = get_score_row(user_id)
-    try:
-        return int(s["balance"])
-    except Exception:
-        return 0
-
-def compute_live_odds(match_id: int) -> Dict[str, float]:
-    """Simple crowd-based odds (no external odds feed).
-    The more people pick an outcome, the lower the odds.
-    """
-    s = match_stats(match_id)
-    total = s["1"] + s["X"] + s["2"]
-
-    # small priors so odds exist even with 0 votes
-    pri_1, pri_x, pri_2 = 2.0, 1.5, 2.0  # draw usually less likely
-    c1 = s["1"] + 1
-    cx = s["X"] + 1
-    c2 = s["2"] + 1
-    denom = (c1 + cx + c2)
-    p1 = c1 / denom
-    px = cx / denom
-    p2 = c2 / denom
-
-    def odds_from_p(p: float, margin: float = 0.08) -> float:
-        p = max(0.05, min(0.95, p))
-        o = (1.0 / p) * (1.0 - margin)
-        return max(1.15, round(o, 2))
-
-    o1 = odds_from_p(p1)
-    ox = odds_from_p(px)
-    o2 = odds_from_p(p2)
-    return {"1": o1, "X": ox, "2": o2}
 def get_score_row(user_id: int) -> sqlite3.Row:
     with db() as con:
         r = con.execute("SELECT * FROM scores WHERE user_id=?", (user_id,)).fetchone()
@@ -1477,6 +1388,7 @@ async def profile(m: Message):
         ),
         reply_markup=main_menu(),
     )
+
 # =========================
 # MAIN
 # =========================
@@ -1490,7 +1402,7 @@ async def main():
     # Keep-alive ping (only if KEEP_ALIVE_URL is set)
     asyncio.create_task(keep_alive_loop())
 
-    # Weekly bonus (Monday 12:00 MSK)
+    # Weekly bonus
     asyncio.create_task(weekly_bonus_loop())
 
     if SYNC_ENABLED:
