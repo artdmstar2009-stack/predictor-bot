@@ -1,3 +1,60 @@
+print('BOT_FULL_FINAL_FIXED_V3')
+
+
+def acquire_polling_lock() -> bool:
+    """Best-effort lock to ensure only one instance runs polling (avoids TelegramConflictError)."""
+    owner = os.getenv("RENDER_INSTANCE_ID") or os.getenv("HOSTNAME") or str(os.getpid())
+    now = iso(now_utc())
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_lock (
+            key TEXT PRIMARY KEY,
+            owner TEXT,
+            updated_at TEXT
+        )
+        """)
+        con.commit()
+        try:
+            cur.execute(
+                "INSERT INTO app_lock(key, owner, updated_at) VALUES(?,?,?)",
+                ("polling", owner, now),
+            )
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            row = cur.execute("SELECT owner, updated_at FROM app_lock WHERE key='polling'").fetchone()
+            if not row:
+                return False
+            try:
+                last = datetime.fromisoformat(row["updated_at"])
+            except Exception:
+                last = now_utc() - timedelta(hours=1)
+            # If lock is stale (no heartbeat for 3 minutes), take over
+            if (now_utc() - last).total_seconds() > 180:
+                cur.execute(
+                    "UPDATE app_lock SET owner=?, updated_at=? WHERE key='polling'",
+                    (owner, now),
+                )
+                con.commit()
+                return True
+            return False
+
+async def polling_lock_heartbeat():
+    owner = os.getenv("RENDER_INSTANCE_ID") or os.getenv("HOSTNAME") or str(os.getpid())
+    while True:
+        try:
+            with db() as con:
+                cur = con.cursor()
+                cur.execute(
+                    "UPDATE app_lock SET updated_at=? WHERE key='polling' AND owner=?",
+                    (iso(now_utc()), owner),
+                )
+                con.commit()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
 # -*- coding: utf-8 -*-
 """
 Predictor Bot (aiogram v3.7+)
@@ -30,8 +87,7 @@ ENV
 - AUTO_RESULTS_ENABLED=1, AUTO_RESULTS_INTERVAL=300, AUTO_RESULTS_MIN_AGE_MIN=20
 - POINTS_FOR_CORRECT=3, POINTS_FOR_WRONG=0
 """
-
-from __future__ import annotations
+print('BOT_FULL_FINAL_FIXED_V3')
 print('BOT_FULL_FINAL_FIXED_V2')
 print('BOT_FULL_FINAL_V5')
 
@@ -42,6 +98,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
