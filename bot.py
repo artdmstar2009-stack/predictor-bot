@@ -1,3 +1,124 @@
+def init_db():
+    with db() as con:
+        cur = con.cursor()
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            updated_at TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sport TEXT,
+            title TEXT,
+            start_time TEXT,
+            league TEXT,
+            status TEXT DEFAULT 'open',
+            result TEXT,
+            deadline TEXT,
+            created_at TEXT,
+            odds_1 REAL,
+            odds_x REAL,
+            odds_2 REAL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS votes (
+            user_id INTEGER,
+            match_id INTEGER,
+            pick TEXT,
+            created_at TEXT,
+            stake INTEGER,
+            odds REAL,
+            UNIQUE(user_id, match_id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS scores (
+            user_id INTEGER PRIMARY KEY,
+            points INTEGER DEFAULT 0,
+            balance INTEGER DEFAULT 0,
+            correct INTEGER DEFAULT 0,
+            total INTEGER DEFAULT 0,
+            streak INTEGER DEFAULT 0,
+            best_streak INTEGER DEFAULT 0,
+            updated_at TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS points_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            match_id INTEGER,
+            points INTEGER,
+            created_at TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS prefs (
+            user_id INTEGER,
+            key TEXT,
+            value TEXT,
+            updated_at TEXT,
+            UNIQUE(user_id, key)
+        )
+        """)
+
+        def _safe(stmt: str):
+            try:
+                cur.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+
+        for stmt in [
+            "ALTER TABLE users ADD COLUMN username TEXT",
+            "ALTER TABLE users ADD COLUMN first_name TEXT",
+            "ALTER TABLE users ADD COLUMN last_name TEXT",
+            "ALTER TABLE users ADD COLUMN updated_at TEXT",
+        ]:
+            _safe(stmt)
+
+        for stmt in [
+            "ALTER TABLE matches ADD COLUMN league TEXT",
+            "ALTER TABLE matches ADD COLUMN status TEXT DEFAULT 'open'",
+            "ALTER TABLE matches ADD COLUMN result TEXT",
+            "ALTER TABLE matches ADD COLUMN deadline TEXT",
+            "ALTER TABLE matches ADD COLUMN created_at TEXT",
+            "ALTER TABLE matches ADD COLUMN odds_1 REAL",
+            "ALTER TABLE matches ADD COLUMN odds_x REAL",
+            "ALTER TABLE matches ADD COLUMN odds_2 REAL",
+        ]:
+            _safe(stmt)
+
+        for stmt in [
+            "ALTER TABLE votes ADD COLUMN stake INTEGER",
+            "ALTER TABLE votes ADD COLUMN odds REAL",
+        ]:
+            _safe(stmt)
+
+        for stmt in [
+            "ALTER TABLE scores ADD COLUMN balance INTEGER DEFAULT 0",
+            "ALTER TABLE scores ADD COLUMN correct INTEGER DEFAULT 0",
+            "ALTER TABLE scores ADD COLUMN total INTEGER DEFAULT 0",
+            "ALTER TABLE scores ADD COLUMN streak INTEGER DEFAULT 0",
+            "ALTER TABLE scores ADD COLUMN best_streak INTEGER DEFAULT 0",
+            "ALTER TABLE scores ADD COLUMN updated_at TEXT",
+        ]:
+            _safe(stmt)
+
+        con.commit()
+
+
 # -*- coding: utf-8 -*-
 """
 Predictor Bot (aiogram v3.7+)
@@ -30,9 +151,6 @@ ENV
 - AUTO_RESULTS_ENABLED=1, AUTO_RESULTS_INTERVAL=300, AUTO_RESULTS_MIN_AGE_MIN=20
 - POINTS_FOR_CORRECT=3, POINTS_FOR_WRONG=0
 """
-
-from __future__ import annotations
-
 import asyncio
 import logging
 import os
@@ -205,53 +323,7 @@ def init_db() -> None:
         """)
 
 
-for stmt in [
-    "ALTER TABLE votes ADD COLUMN stake INTEGER",
-    "ALTER TABLE votes ADD COLUMN odds REAL",
-]:
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS scores (
-            user_id INTEGER PRIMARY KEY,
-            points INTEGER DEFAULT 0,
-            correct INTEGER DEFAULT 0,
-            total INTEGER DEFAULT 0,
-            streak INTEGER DEFAULT 0,
-            best_streak INTEGER DEFAULT 0,
-            updated_at TEXT
-        )
-        """)
-for stmt in [
-    "ALTER TABLE scores ADD COLUMN balance INTEGER DEFAULT 0",
-]:
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
-
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS points_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            match_id INTEGER,
-            points INTEGER,
-            created_at TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS featured (
-            day_utc TEXT PRIMARY KEY,
-            match_id INTEGER,
-            created_at TEXT
-        )
-        """)
-
-        con.commit()
+# (patched) removed misplaced top-level ALTER loop
 
 def upsert_user_from_message(m: Message | CallbackQuery) -> None:
     u = m.from_user
