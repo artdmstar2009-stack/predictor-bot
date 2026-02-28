@@ -343,7 +343,14 @@ def upsert_user_from_message(m: Message | CallbackQuery) -> None:
               last_name=excluded.last_name,
               updated_at=excluded.updated_at
         """, (u.id, u.username or "", u.first_name or "", u.last_name or "", iso(now_utc())))
-        cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at) VALUES(?,?)", (u.id, iso(now_utc())))
+        try:
+            cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at) VALUES(?,?)", (u.id, iso(now_utc())))
+        except sqlite3.OperationalError as e:
+            if 'no such table' in str(e).lower():
+                init_db()
+                cur.execute("INSERT OR IGNORE INTO scores(user_id, updated_at) VALUES(?,?)", (u.id, iso(now_utc())))
+            else:
+                raise
         con.commit()
 
 def pretty_user(user_id: int) -> str:
