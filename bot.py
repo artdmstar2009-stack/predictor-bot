@@ -77,12 +77,22 @@ def init_db():
         )
         """)
 
+        # Featured match of the day (UTC day key)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS featured (
+            day_utc TEXT PRIMARY KEY,
+            match_id INTEGER,
+            created_at TEXT
+        )
+        """)
+
         def _safe(stmt: str):
             try:
                 cur.execute(stmt)
             except sqlite3.OperationalError:
                 pass
 
+        # Backward-compatible ALTERs
         for stmt in [
             "ALTER TABLE users ADD COLUMN username TEXT",
             "ALTER TABLE users ADD COLUMN first_name TEXT",
@@ -119,128 +129,14 @@ def init_db():
         ]:
             _safe(stmt)
 
+        # featured table columns (if created without them in older build)
+        for stmt in [
+            "ALTER TABLE featured ADD COLUMN match_id INTEGER",
+            "ALTER TABLE featured ADD COLUMN created_at TEXT",
+        ]:
+            _safe(stmt)
+
         con.commit()
-
-
-# -*- coding: utf-8 -*-
-"""
-Predictor Bot (aiogram v3.7+)
-
-UI
-- Главное меню (кнопки)
-- ⚡ Активные матчи -> выбор спорта -> список матчей (пагинация) -> карточка матча
-- 🔎 Поиск матча по названию/командам
-- 🔖 Короткий код матча (ABC-DEF • HH:MM)
-
-Функции
-- Только 1X2
-- Дедлайн прогнозов: PREDICT_DEADLINE_MIN минут до старта
-- Автосинк матчей: football-data.org + NHL
-- Авто-итоги и начисление очков
-- Профиль + лидерборд
-- Keep-alive (Render free): пинг public /health если задан KEEP_ALIVE_URL
-- Render health server на 0.0.0.0:$PORT (если PORT задан)
-
-ENV
-- BOT_TOKEN (required)
-- ADMIN_ID (optional)
-- PORT (Render sets; if you deploy as Web Service)
-- KEEP_ALIVE_URL (optional, e.g. https://<service>.onrender.com/health)
-- KEEP_ALIVE_INTERVAL=300
-- PREDICT_DEADLINE_MIN=5
-- SYNC_ENABLED=1, SYNC_INTERVAL=3600, SYNC_LOOKAHEAD_DAYS=1
-- FOOTBALL_ENABLED=1, FOOTBALL_DATA_TOKEN=..., FOOTBALL_COMPETITIONS=PL,CL,PD,SA,BL1,FL1
-- NHL_ENABLED=1
-- AUTO_RESULTS_ENABLED=1, AUTO_RESULTS_INTERVAL=300, AUTO_RESULTS_MIN_AGE_MIN=20
-- POINTS_FOR_CORRECT=3, POINTS_FOR_WRONG=0
-"""
-import asyncio
-import logging
-import os
-import re
-import sqlite3
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
-
-import aiohttp
-from aiohttp import web
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-)
-
-# =========================
-# CONFIG
-# =========================
-
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-PORT = int(os.getenv("PORT", "0") or "0")
-
-KEEP_ALIVE_URL = (os.getenv("KEEP_ALIVE_URL") or "").strip()
-KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "300") or "300")
-
-PREDICT_DEADLINE_MIN = int(os.getenv("PREDICT_DEADLINE_MIN", "5") or "5")
-
-SYNC_ENABLED = os.getenv("SYNC_ENABLED", "1") == "1"
-SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "3600") or "3600")
-SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", "1") or "1")
-
-FOOTBALL_ENABLED = os.getenv("FOOTBALL_ENABLED", "1") == "1"
-FOOTBALL_DATA_TOKEN = (os.getenv("FOOTBALL_DATA_TOKEN") or "").strip()
-FOOTBALL_COMPETITIONS = [
-    c.strip()
-    for c in (os.getenv("FOOTBALL_COMPETITIONS") or "PL,CL,PD,SA,BL1,FL1").split(",")
-    if c.strip()
-]
-FOOTBALL_BASE = (os.getenv("FOOTBALL_BASE") or "https://api.football-data.org/v4").rstrip("/")
-
-NHL_ENABLED = os.getenv("NHL_ENABLED", "1") == "1"
-
-AUTO_RESULTS_ENABLED = os.getenv("AUTO_RESULTS_ENABLED", "1") == "1"
-AUTO_RESULTS_INTERVAL = int(os.getenv("AUTO_RESULTS_INTERVAL", "300") or "300")
-AUTO_RESULTS_MIN_AGE_MIN = int(os.getenv("AUTO_RESULTS_MIN_AGE_MIN", "20") or "20")
-
-POINTS_FOR_CORRECT = int(os.getenv("POINTS_FOR_CORRECT", "3") or "3")
-POINTS_FOR_WRONG = int(os.getenv("POINTS_FOR_WRONG", "0") or "0")
-
-# Betting / bankroll
-BETTING_ENABLED = os.getenv("BETTING_ENABLED", "1") == "1"
-WEEKLY_BONUS_ENABLED = os.getenv("WEEKLY_BONUS_ENABLED", "1") == "1"
-WEEKLY_BONUS_AMOUNT = int(os.getenv("WEEKLY_BONUS_AMOUNT", "1000") or "1000")
-DISPLAY_TZ = os.getenv("DISPLAY_TZ", "Europe/Moscow")
-try:
-    DISPLAY_ZONE = ZoneInfo(DISPLAY_TZ)
-except Exception:
-    DISPLAY_ZONE = ZoneInfo("Europe/Moscow")
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("predictor_bot")
-
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-# =========================
-# IN-MEMORY PREFS
-# =========================
-
-PREFS: Dict[int, Dict[str, Any]] = {}
 
 def set_pref(user_id: int, **data: Any) -> None:
     cur = PREFS.get(user_id, {})
