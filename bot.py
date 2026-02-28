@@ -32,6 +32,7 @@ ENV
 """
 
 from __future__ import annotations
+print('BOT_FULL_FINAL_FIXED_V2')
 print('BOT_FULL_FINAL_V5')
 
 import asyncio
@@ -204,6 +205,13 @@ def init_db() -> None:
     with db() as con:
         cur = con.cursor()
 
+
+        def _safe(stmt: str):
+            try:
+                cur.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -279,34 +287,20 @@ def init_db() -> None:
         """)
 
         
-for stmt in [
-    "ALTER TABLE votes ADD COLUMN stake INTEGER",
-    "ALTER TABLE votes ADD COLUMN odds REAL",
-]:
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
+# (patched) removed misplaced top-level migration loop (was causing cur NameError)
 
-for stmt in [
-    "ALTER TABLE scores ADD COLUMN balance INTEGER DEFAULT 0",
-]:
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
-
-for stmt in [
-    "ALTER TABLE matches ADD COLUMN odds_1 REAL",
-    "ALTER TABLE matches ADD COLUMN odds_x REAL",
-    "ALTER TABLE matches ADD COLUMN odds_2 REAL",
-]:
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
-
-con.commit()
+        # (patched) extra backward-compatible ALTERs
+        for stmt in [
+            'ALTER TABLE matches ADD COLUMN odds_1 REAL',
+            'ALTER TABLE matches ADD COLUMN odds_x REAL',
+            'ALTER TABLE matches ADD COLUMN odds_2 REAL',
+            'ALTER TABLE votes ADD COLUMN stake INTEGER',
+            'ALTER TABLE votes ADD COLUMN odds REAL',
+            'ALTER TABLE scores ADD COLUMN balance INTEGER',
+            'ALTER TABLE featured ADD COLUMN match_id INTEGER',
+            'ALTER TABLE featured ADD COLUMN created_at TEXT',
+        ]:
+            _safe(stmt)
 
 def upsert_user_from_message(m: Message | CallbackQuery) -> None:
     u = m.from_user
