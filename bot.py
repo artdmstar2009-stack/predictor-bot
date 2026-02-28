@@ -1,3 +1,6 @@
+BOOT_MARKER = 'BOT_PATCHED_V1'
+print(BOOT_MARKER)
+
 def init_db():
     with db() as con:
         cur = con.cursor()
@@ -1577,7 +1580,10 @@ async def main():
     asyncio.create_task(keep_alive_loop())
 
     # Weekly bonus (Monday 12:00 MSK)
-    asyncio.create_task(weekly_bonus_loop())
+    if 'weekly_bonus_loop' in globals():
+        asyncio.create_task(weekly_bonus_loop())
+    else:
+        logger.warning('weekly_bonus_loop is not defined; skipping weekly bonus task')
 
     if SYNC_ENABLED:
         asyncio.create_task(autosync_loop())
