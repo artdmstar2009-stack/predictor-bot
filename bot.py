@@ -1,4 +1,4 @@
-print('BOT_FULL_FINAL_FIXED_V3')
+print('BOT_ODDS_REAL_V1')
 
 
 def acquire_polling_lock() -> bool:
@@ -87,7 +87,7 @@ ENV
 - AUTO_RESULTS_ENABLED=1, AUTO_RESULTS_INTERVAL=300, AUTO_RESULTS_MIN_AGE_MIN=20
 - POINTS_FOR_CORRECT=3, POINTS_FOR_WRONG=0
 """
-print('BOT_FULL_FINAL_FIXED_V3')
+print('BOT_ODDS_REAL_V1')
 print('BOT_FULL_FINAL_FIXED_V2')
 print('BOT_FULL_FINAL_V5')
 
@@ -250,8 +250,7 @@ def match_odds_for_pick(match: dict, pick: str) -> float:
             return float(match["odds_2"])
     except Exception:
         pass
-    return 2.0
-
+    return None
 def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
@@ -358,6 +357,174 @@ def init_db() -> None:
             'ALTER TABLE featured ADD COLUMN created_at TEXT',
         ]:
             _safe(stmt)
+
+
+# ================= ODDS API (The Odds API) =================
+
+def _norm_team(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"[\(\)\[\]\{\}]", " ", s)
+    s = re.sub(r"[^a-z0-9а-яё\s\-\.]", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _parse_title_teams(title: str) -> tuple[str, str] | None:
+    t = (title or "").strip()
+    low = t.lower()
+    seps = [" vs ", " vs. ", " v ", " — ", " - ", " – "]
+    for sep in seps:
+        if sep in low:
+            parts = re.split(re.escape(sep), t, flags=re.IGNORECASE)
+            if len(parts) >= 2:
+                a = parts[0].strip()
+                b = parts[1].strip()
+                if a and b:
+                    return a, b
+    return None
+
+async def _odds_api_get_json(session: aiohttp.ClientSession, path: str, params: dict) -> Any:
+    url = f"{ODDS_BASE_URL}{path}"
+    params = dict(params)
+    params["apiKey"] = ODDS_API_KEY
+    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+        if resp.status != 200:
+            text = await resp.text()
+            raise RuntimeError(f"Odds API HTTP {resp.status}: {text[:300]}")
+        return await resp.json()
+
+async def odds_list_sports(session: aiohttp.ClientSession) -> list[dict]:
+    return await _odds_api_get_json(session, "/v4/sports", {"all": "false"})
+
+async def odds_fetch_for_sport(session: aiohttp.ClientSession, sport_key: str) -> list[dict]:
+    return await _odds_api_get_json(
+        session,
+        f"/v4/sports/{sport_key}/odds",
+        {
+            "regions": ODDS_REGIONS,
+            "markets": ODDS_MARKETS,
+            "oddsFormat": ODDS_ODDS_FORMAT,
+            "dateFormat": ODDS_DATE_FORMAT,
+        },
+    )
+
+def _pick_bookmaker(bookmakers: list[dict]) -> tuple[str, dict] | None:
+    if not bookmakers:
+        return None
+    by_key = {b.get("key"): b for b in bookmakers if b.get("key")}
+    for pref in ODDS_PREFERRED_BOOKS:
+        if pref in by_key:
+            return pref, by_key[pref]
+    b = bookmakers[0]
+    return (b.get("key") or "unknown"), b
+
+def _extract_h2h_prices(book: dict) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for market in book.get("markets", []) or []:
+        if market.get("key") != "h2h":
+            continue
+        for o in market.get("outcomes", []) or []:
+            name = o.get("name")
+            price = o.get("price")
+            if name and isinstance(price, (int, float)):
+                out[name] = float(price)
+    return out
+
+def _map_prices_to_1x2(event: dict, prices: dict[str, float]) -> tuple[float | None, float | None, float | None]:
+    home = event.get("home_team")
+    away = event.get("away_team")
+    o1 = prices.get(home) if home else None
+    o2 = prices.get(away) if away else None
+    ox = prices.get("Draw") or prices.get("draw")
+    return o1, ox, o2
+
+async def refresh_odds_once() -> int:
+    if not ODDS_API_KEY:
+        return 0
+
+    now = now_utc()
+    horizon = now + timedelta(hours=ODDS_LOOKAHEAD_HOURS)
+
+    with db() as con:
+        cur = con.cursor()
+        rows = cur.execute(
+            "SELECT id, sport, title, start_time FROM matches "
+            "WHERE start_time IS NOT NULL AND start_time >= ? AND start_time <= ?",
+            (iso(now), iso(horizon)),
+        ).fetchall()
+
+    candidates = []
+    for r in rows:
+        teams = _parse_title_teams(r["title"])
+        if not teams:
+            continue
+        nh, na = _norm_team(teams[0]), _norm_team(teams[1])
+        if nh and na:
+            candidates.append((int(r["id"]), nh, na))
+
+    if not candidates:
+        return 0
+
+    updated = 0
+    async with aiohttp.ClientSession() as session:
+        sports = await odds_list_sports(session)
+
+        sport_keys: list[str] = []
+        for s in sports:
+            if not s.get("active"):
+                continue
+            key = s.get("key")
+            group = (s.get("group") or "").lower()
+            if not key:
+                continue
+            if "soccer" in group or key == "icehockey_nhl":
+                sport_keys.append(key)
+
+        for skey in sport_keys:
+            try:
+                events = await odds_fetch_for_sport(session, skey)
+            except Exception as e:
+                logger.warning("Odds fetch failed for %s: %s", skey, e)
+                continue
+
+            event_map: dict[tuple[str, str], dict] = {}
+            for ev in events or []:
+                ht, at = ev.get("home_team"), ev.get("away_team")
+                if not ht or not at:
+                    continue
+                event_map[(_norm_team(ht), _norm_team(at))] = ev
+
+            with db() as con:
+                cur = con.cursor()
+                for mid, nh, na in candidates:
+                    ev = event_map.get((nh, na)) or event_map.get((na, nh))
+                    if not ev:
+                        continue
+                    pick = _pick_bookmaker(ev.get("bookmakers", []) or [])
+                    if not pick:
+                        continue
+                    bkey, book = pick
+                    prices = _extract_h2h_prices(book)
+                    if not prices:
+                        continue
+                    o1, ox, o2 = _map_prices_to_1x2(ev, prices)
+                    cur.execute(
+                        "UPDATE matches SET odds_1=?, odds_x=?, odds_2=?, odds_updated_at=?, odds_source=? WHERE id=?",
+                        (o1, ox, o2, iso(now_utc()), bkey, mid),
+                    )
+                    updated += 1
+                con.commit()
+
+    return updated
+
+async def odds_refresh_loop():
+    while True:
+        try:
+            n = await refresh_odds_once()
+            if n:
+                logger.info("Odds updated for %s matches", n)
+        except Exception as e:
+            logger.exception("odds_refresh_loop error: %s", e)
+        await asyncio.sleep(max(60, ODDS_REFRESH_INTERVAL))
 
 def upsert_user_from_message(m: Message | CallbackQuery) -> None:
     u = m.from_user
@@ -1033,6 +1200,20 @@ async def sync_cmd(m: Message):
     pick_featured_for_today()
     await m.answer(f"✅ {msg}", reply_markup=main_menu())
 
+
+@dp.message(Command("odds_now"))
+async def odds_now_cmd(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("Недостаточно прав.")
+    if not ODDS_API_KEY:
+        return await m.answer("ODDS_API_KEY не задан в ENV.")
+    await m.answer("Обновляю коэффициенты...")
+    try:
+        n = await refresh_odds_once()
+        await m.answer(f"✅ Готово. Обновлено матчей: {n}")
+    except Exception as e:
+        await m.answer(f"❌ Ошибка: {e}")
+
 @dp.message(F.text == BTN_ACTIVE)
 async def active_matches(m: Message):
     upsert_user_from_message(m)
@@ -1544,6 +1725,8 @@ async def weekly_bonus_loop():
 
 async def main():
     init_db()
+    if ODDS_API_KEY:
+        asyncio.create_task(odds_refresh_loop())
     asyncio.create_task(weekly_bonus_loop())
 
     # For Render Web Service: keep port open (health endpoint)
