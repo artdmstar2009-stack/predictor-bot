@@ -1,5 +1,5 @@
 import os
-print("BOT_ODDS_REAL_FIXED8", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_ODDS_REAL_FIXED9", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 def acquire_polling_lock() -> bool:
@@ -369,6 +369,13 @@ def init_db() -> None:
 
 
 # ================= ODDS API (The Odds API) =================
+
+        # (patched) odds metadata columns
+        for stmt in [
+            'ALTER TABLE matches ADD COLUMN odds_updated_at TEXT',
+            'ALTER TABLE matches ADD COLUMN odds_source TEXT',
+        ]:
+            _safe(stmt)
 
 def _norm_team(s: str) -> str:
     s = (s or "").lower().strip()
@@ -1264,6 +1271,7 @@ async def odds_now_cmd(m: Message):
         return await m.answer("ODDS_API_KEY не задан в ENV.")
     await m.answer("Обновляю коэффициенты...")
     try:
+        init_db()
         n = await refresh_odds_once()
         await m.answer(f"✅ Готово. Обновлено матчей: {n}")
     except Exception as e:
