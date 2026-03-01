@@ -1,13 +1,6 @@
 
-def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
-    try:
-        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
-        return any(r[1] == column for r in rows)
-    except Exception:
-        return False
-
 import os
-print("BOT_ODDS_REAL_FIXED10", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_ODDS_REAL_FIXED11", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 def acquire_polling_lock() -> bool:
@@ -105,6 +98,14 @@ import logging
 import os
 import re
 import sqlite3
+
+def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == column for r in rows)
+    except Exception:
+        return False
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
