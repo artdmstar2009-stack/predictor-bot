@@ -1,5 +1,5 @@
 import os
-print("BOT_ODDS_REAL_FIXED7", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_ODDS_REAL_FIXED8", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 def acquire_polling_lock() -> bool:
@@ -163,13 +163,15 @@ WEEKLY_BONUS_ENABLED = os.getenv("WEEKLY_BONUS_ENABLED", "1") == "1"
 WEEKLY_BONUS_AMOUNT = int(os.getenv("WEEKLY_BONUS_AMOUNT", "1000"))
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
-ODDS_PROVIDER = os.getenv("ODDS_PROVIDER", "none").lower()  # 'theoddsapi' or 'none'
-ODDS_BASE_URL = os.getenv("ODDS_BASE_URL", "https://api.the-odds-api.com")
-ODDS_REGIONS = os.getenv("ODDS_REGIONS", "eu")
+ODDS_BASE_URL = os.getenv("ODDS_BASE_URL", "https://api.the-odds-api.com").rstrip("/")
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "eu")  # eu/us/uk/au
 ODDS_MARKETS = os.getenv("ODDS_MARKETS", "h2h")
+ODDS_ODDS_FORMAT = os.getenv("ODDS_ODDS_FORMAT", "decimal")
 ODDS_DATE_FORMAT = os.getenv("ODDS_DATE_FORMAT", "iso")
 ODDS_REFRESH_INTERVAL = int(os.getenv("ODDS_REFRESH_INTERVAL", "900"))
 ODDS_LOOKAHEAD_HOURS = int(os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+ODDS_PREFERRED_BOOKS = [s.strip() for s in os.getenv("ODDS_PREFERRED_BOOKS", "pinnacle,bet365,williamhill").split(",") if s.strip()]
+ODDS_PROVIDER = os.getenv("ODDS_PROVIDER", "none").lower()  # 'theoddsapi' or 'none'
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -1911,4 +1913,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
