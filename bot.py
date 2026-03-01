@@ -1,5 +1,13 @@
+
+def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == column for r in rows)
+    except Exception:
+        return False
+
 import os
-print("BOT_ODDS_REAL_FIXED9", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_ODDS_REAL_FIXED10", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 def acquire_polling_lock() -> bool:
@@ -569,10 +577,17 @@ async def refresh_odds_once() -> int:
                     if not prices:
                         continue
                     o1, ox, o2 = _map_prices_to_1x2(best, prices)
-                    cur.execute(
-                        "UPDATE matches SET odds_1=?, odds_x=?, odds_2=?, odds_updated_at=?, odds_source=? WHERE id=?",
-                        (o1, ox, o2, iso(now_utc()), bkey, mid),
-                    )
+                    # Dynamic update: support older DB schema
+                    if _has_column(con, "matches", "odds_updated_at") and _has_column(con, "matches", "odds_source"):
+                        cur.execute(
+                            "UPDATE matches SET odds_1=?, odds_x=?, odds_2=?, odds_updated_at=?, odds_source=? WHERE id=?",
+                            (o1, ox, o2, iso(now_utc()), bkey, mid),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE matches SET odds_1=?, odds_x=?, odds_2=? WHERE id=?",
+                            (o1, ox, o2, mid),
+                        )
                     updated += 1
                 con.commit()
 
