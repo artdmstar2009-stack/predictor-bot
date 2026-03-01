@@ -1275,6 +1275,113 @@ async def cb_back_sports(cb: CallbackQuery):
     await cb.answer()
 
 @dp.callback_query(F.data == "noop")
+
+
+# =========================
+# CALLBACKS: OPEN MATCH / STATS / PICK
+# =========================
+
+@dp.callback_query(F.data.startswith("sport:"))
+async def cb_sport_page(cb: CallbackQuery):
+    # sport:{sport}:{page}
+    try:
+        _, sport, page_s = cb.data.split(":")
+        page = int(page_s)
+    except Exception:
+        return await cb.answer("Ошибка.", show_alert=True)
+    await cb.message.edit_reply_markup(reply_markup=ikb_matches_list(sport, page))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("match:"))
+async def cb_match_open(cb: CallbackQuery):
+    upsert_user_from_message(cb)
+    try:
+        _, mid_s = cb.data.split(":")
+        mid = int(mid_s)
+    except Exception:
+        return await cb.answer("Ошибка.", show_alert=True)
+
+    match = get_match(mid)
+    if not match:
+        return await cb.answer("Матч не найден.", show_alert=True)
+
+    # Show card with odds (if present)
+    o1 = match.get("odds_1")
+    ox = match.get("odds_x")
+    o2 = match.get("odds_2")
+    odds_line = ""
+    if o1 or ox or o2:
+        parts = []
+        if o1: parts.append(f"1: <b>{float(o1):.2f}</b>")
+        if ox: parts.append(f"X: <b>{float(ox):.2f}</b>")
+        if o2: parts.append(f"2: <b>{float(o2):.2f}</b>")
+        odds_line = "\nКоэффициенты: " + "  ".join(parts)
+
+    text = f"🏟 <b>{match['title']}</b>\n🕒 {fmt_dt(match.get('start_time_utc') or match.get('start_time') or '')}{odds_line}\n\nВыбери исход:"
+    await cb.message.answer(text, reply_markup=ikb_match_card(mid))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("stats:"))
+async def cb_stats(cb: CallbackQuery):
+    try:
+        _, mid_s = cb.data.split(":")
+        mid = int(mid_s)
+    except Exception:
+        return await cb.answer("Ошибка.", show_alert=True)
+
+    st = match_stats(mid)
+    total = st["1"] + st["X"] + st["2"]
+    if total == 0:
+        return await cb.answer("Пока нет голосов.", show_alert=True)
+
+    msg = (
+        f"📊 Голоса по матчу #{mid}:\n"
+        f"1: {st['1']}\nX: {st['X']}\n2: {st['2']}\n"
+        f"Всего: {total}"
+    )
+    await cb.answer()
+    await cb.message.answer(msg)
+
+@dp.callback_query(F.data.startswith("pick:"))
+async def cb_pick(cb: CallbackQuery):
+    upsert_user_from_message(cb)
+    try:
+        _, mid_s, pick = cb.data.split(":")
+        mid = int(mid_s)
+    except Exception:
+        return await cb.answer("Ошибка.", show_alert=True)
+
+    if pick not in ("1", "X", "2"):
+        return await cb.answer("Неверный исход.", show_alert=True)
+
+    match = get_match(mid)
+    if not match:
+        return await cb.answer("Матч не найден.", show_alert=True)
+
+    ok, reason = can_predict(match)
+    if not ok:
+        return await cb.answer(reason, show_alert=True)
+
+    odds = match_odds_for_pick(dict(match), pick)
+    if not odds:
+        # try refresh quickly for admin convenience
+        if ODDS_API_KEY:
+            try:
+                await cb.answer("Коэффициенты обновляются, попробуй ещё раз через минуту.", show_alert=True)
+            except Exception:
+                pass
+        else:
+            await cb.answer("Коэффициенты недоступны.", show_alert=True)
+        return
+
+    # store pending pick and show stake options
+    set_pref(cb.from_user.id, awaiting_stake=True, awaiting_custom_stake=False, pending_match_id=mid, pending_pick=pick)
+    await cb.message.answer(
+        f"✅ Выбран исход <b>{pick}</b> (кф <b>{float(odds):.2f}</b>).\nВыбери сумму ставки:",
+        reply_markup=ikb_stake_amounts(mid, pick),
+    )
+    await cb.answer()
+
 async def cb_noop(cb: CallbackQuery):
     await cb.answer()
 
