@@ -163,8 +163,13 @@ WEEKLY_BONUS_ENABLED = os.getenv("WEEKLY_BONUS_ENABLED", "1") == "1"
 WEEKLY_BONUS_AMOUNT = int(os.getenv("WEEKLY_BONUS_AMOUNT", "1000"))
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
-ODDS_LOOKAHEAD_HOURS = int(os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 ODDS_PROVIDER = os.getenv("ODDS_PROVIDER", "none").lower()  # 'theoddsapi' or 'none'
+ODDS_BASE_URL = os.getenv("ODDS_BASE_URL", "https://api.the-odds-api.com")
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "eu")
+ODDS_MARKETS = os.getenv("ODDS_MARKETS", "h2h")
+ODDS_DATE_FORMAT = os.getenv("ODDS_DATE_FORMAT", "iso")
+ODDS_REFRESH_INTERVAL = int(os.getenv("ODDS_REFRESH_INTERVAL", "900"))
+ODDS_LOOKAHEAD_HOURS = int(os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -1906,3 +1911,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
