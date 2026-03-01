@@ -1,4 +1,5 @@
-print("BOT_ODDS_REAL_FIXED6", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+import os
+print("BOT_ODDS_REAL_FIXED7", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 def acquire_polling_lock() -> bool:
