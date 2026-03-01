@@ -1,4 +1,4 @@
-print('BOT_ODDS_REAL_V1')
+print('BOT_ODDS_REAL_V3')
 
 
 def acquire_polling_lock() -> bool:
@@ -87,7 +87,7 @@ ENV
 - AUTO_RESULTS_ENABLED=1, AUTO_RESULTS_INTERVAL=300, AUTO_RESULTS_MIN_AGE_MIN=20
 - POINTS_FOR_CORRECT=3, POINTS_FOR_WRONG=0
 """
-print('BOT_ODDS_REAL_V1')
+print('BOT_ODDS_REAL_V3')
 print('BOT_FULL_FINAL_FIXED_V2')
 print('BOT_FULL_FINAL_V5')
 
@@ -380,7 +380,14 @@ def _parse_title_teams(title: str) -> tuple[str, str] | None:
                 b = parts[1].strip()
                 if a and b:
                     return a, b
-    return None
+            # dash without spaces like "HAM-RB"
+        m2 = re.match(r"^(.+?)[\-–—](.+)$", t)
+        if m2:
+            a, b = m2.group(1).strip(), m2.group(2).strip()
+            if a and b:
+                return a, b
+
+        return None
 
 async def _odds_api_get_json(session: aiohttp.ClientSession, path: str, params: dict) -> Any:
     url = f"{ODDS_BASE_URL}{path}"
@@ -486,27 +493,66 @@ async def refresh_odds_once() -> int:
                 logger.warning("Odds fetch failed for %s: %s", skey, e)
                 continue
 
-            event_map: dict[tuple[str, str], dict] = {}
+            # Build list of events for fuzzy matching (by time + token overlap)
+            ev_list: list[dict] = []
             for ev in events or []:
                 ht, at = ev.get("home_team"), ev.get("away_team")
-                if not ht or not at:
+                ct = ev.get("commence_time")
+                if not ht or not at or not ct:
                     continue
-                event_map[(_norm_team(ht), _norm_team(at))] = ev
+                try:
+                    ev_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                ev_list.append({"ev": ev, "ht": ht, "at": at, "dt": ev_dt})
+
+            def _team_tokens(s: str) -> set[str]:
+                s = _norm_team(s)
+                toks = {t for t in re.split(r"\s+", s) if len(t) >= 2}
+                return toks
 
             with db() as con:
                 cur = con.cursor()
                 for mid, nh, na in candidates:
-                    ev = event_map.get((nh, na)) or event_map.get((na, nh))
-                    if not ev:
+                    row = cur.execute("SELECT start_time FROM matches WHERE id=?", (mid,)).fetchone()
+                    if not row or not row["start_time"]:
                         continue
-                    pick = _pick_bookmaker(ev.get("bookmakers", []) or [])
+                    try:
+                        mdt = datetime.fromisoformat(row["start_time"])
+                        if mdt.tzinfo is None:
+                            mdt = mdt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+
+                    tA = _team_tokens(nh)
+                    tB = _team_tokens(na)
+
+                    best = None
+                    best_score = -1
+                    for item in ev_list:
+                        ev_dt = item["dt"]
+                        if abs((ev_dt - mdt).total_seconds()) > 3 * 3600:
+                            continue
+                        ht_t = _team_tokens(item["ht"])
+                        at_t = _team_tokens(item["at"])
+                        s1 = (len(tA & ht_t) + len(tB & at_t))
+                        s2 = (len(tA & at_t) + len(tB & ht_t))
+                        score = max(s1, s2)
+                        if score > best_score:
+                            best_score = score
+                            best = item["ev"]
+
+                    if not best or best_score <= 0:
+                        continue
+
+                    pick = _pick_bookmaker(best.get("bookmakers", []) or [])
                     if not pick:
                         continue
                     bkey, book = pick
                     prices = _extract_h2h_prices(book)
                     if not prices:
                         continue
-                    o1, ox, o2 = _map_prices_to_1x2(ev, prices)
+                    o1, ox, o2 = _map_prices_to_1x2(best, prices)
                     cur.execute(
                         "UPDATE matches SET odds_1=?, odds_x=?, odds_2=?, odds_updated_at=?, odds_source=? WHERE id=?",
                         (o1, ox, o2, iso(now_utc()), bkey, mid),
