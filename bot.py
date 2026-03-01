@@ -1,4 +1,4 @@
-print('BOT_ODDS_REAL_V3_4')
+print("BOT_ODDS_REAL_FIXED6", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 def acquire_polling_lock() -> bool:
@@ -162,6 +162,7 @@ WEEKLY_BONUS_ENABLED = os.getenv("WEEKLY_BONUS_ENABLED", "1") == "1"
 WEEKLY_BONUS_AMOUNT = int(os.getenv("WEEKLY_BONUS_AMOUNT", "1000"))
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+ODDS_LOOKAHEAD_HOURS = int(os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 ODDS_PROVIDER = os.getenv("ODDS_PROVIDER", "none").lower()  # 'theoddsapi' or 'none'
 
 
@@ -449,7 +450,7 @@ async def refresh_odds_once() -> int:
         return 0
 
     now = now_utc()
-    horizon = now + timedelta(hours=ODDS_LOOKAHEAD_HOURS)
+    horizon = now + timedelta(hours=int(globals().get("ODDS_LOOKAHEAD_HOURS", 72)))
 
     with db() as con:
         cur = con.cursor()
