@@ -18,7 +18,7 @@ def ikb_stake_amounts(match_id: int, pick: str) -> 'InlineKeyboardMarkup':
 
 
 import os
-print("BOT_AI_FORM_V2", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_AI_FORM_V3", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 
@@ -2134,16 +2134,34 @@ async def on_custom_stake_amount(m: Message):
 # =========================
 @dp.message(Command("secret_add5000"))
 async def secret_add5000(m: Message):
-    if m.from_user.id != ADMIN_ID:
-        return  # silently ignore for others
+    # secret admin-only command: silently ignore everyone else
+    if int(m.from_user.id) != int(ADMIN_ID):
+        return
 
     upsert_user_from_message(m)
+
     with db() as con:
         cur = con.cursor()
-        cur.execute("UPDATE scores SET balance = COALESCE(balance,0) + 5000 WHERE user_id=?", (m.from_user.id,))
+        # ensure score row exists
+        cur.execute(
+            "INSERT OR IGNORE INTO scores(user_id, points, balance, correct, total, streak, best_streak, updated_at) "
+            "VALUES(?, 0, 0, 0, 0, 0, 0, ?)",
+            (m.from_user.id, iso(now_utc())),
+        )
+        cur.execute(
+            "UPDATE scores SET balance = COALESCE(balance,0) + 5000, updated_at=? WHERE user_id=?",
+            (iso(now_utc()), m.from_user.id),
+        )
         con.commit()
 
     await m.answer("💰 +5000 баллов начислено на баланс (тестовая команда).")
+
+
+@dp.message(Command("secret_whoami"))
+async def secret_whoami(m: Message):
+    if int(m.from_user.id) != int(ADMIN_ID):
+        return
+    await m.answer(f"ADMIN_ID={ADMIN_ID}\nYOUR_ID={m.from_user.id}")
 
 
 async def main():
