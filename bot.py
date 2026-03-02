@@ -18,7 +18,7 @@ def ikb_stake_amounts(match_id: int, pick: str) -> 'InlineKeyboardMarkup':
 
 
 import os
-print("BOT_AI_ODDS_V1", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_AI_CLEAN_FULL_V2", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 
@@ -304,7 +304,6 @@ def init_db() -> None:
     with db() as con:
         cur = con.cursor()
 
-
         def _safe(stmt: str):
             try:
                 cur.execute(stmt)
@@ -330,6 +329,7 @@ def init_db() -> None:
             result TEXT
         )
         """)
+
         for stmt in [
             "ALTER TABLE matches ADD COLUMN sport TEXT",
             "ALTER TABLE matches ADD COLUMN league TEXT",
@@ -337,11 +337,14 @@ def init_db() -> None:
             "ALTER TABLE matches ADD COLUMN external_id TEXT",
             "ALTER TABLE matches ADD COLUMN start_time_utc TEXT",
             "ALTER TABLE matches ADD COLUMN created_at TEXT",
+            "ALTER TABLE matches ADD COLUMN odds_1 REAL",
+            "ALTER TABLE matches ADD COLUMN odds_x REAL",
+            "ALTER TABLE matches ADD COLUMN odds_2 REAL",
+            "ALTER TABLE matches ADD COLUMN odds_updated_at TEXT",
+            "ALTER TABLE matches ADD COLUMN odds_source TEXT",
         ]:
-            try:
-                cur.execute(stmt)
-            except sqlite3.OperationalError:
-                pass
+            _safe(stmt)
+
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_src_ext ON matches(source, external_id)")
 
         cur.execute("""
@@ -353,6 +356,11 @@ def init_db() -> None:
             UNIQUE(user_id, match_id)
         )
         """)
+        for stmt in [
+            "ALTER TABLE votes ADD COLUMN stake INTEGER",
+            "ALTER TABLE votes ADD COLUMN odds REAL",
+        ]:
+            _safe(stmt)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS scores (
@@ -385,32 +393,18 @@ def init_db() -> None:
         )
         """)
 
-        
-# (patched) removed misplaced top-level migration loop (was causing cur NameError)
+        # AI odds: ELO ratings table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS team_ratings (
+            sport TEXT,
+            team TEXT,
+            elo INTEGER,
+            updated_at TEXT,
+            PRIMARY KEY (sport, team)
+        )
+        """)
 
-        # (patched) extra backward-compatible ALTERs
-        for stmt in [
-            'ALTER TABLE matches ADD COLUMN odds_1 REAL',
-            'ALTER TABLE matches ADD COLUMN odds_x REAL',
-            'ALTER TABLE matches ADD COLUMN odds_2 REAL',
-            'ALTER TABLE votes ADD COLUMN stake INTEGER',
-            'ALTER TABLE votes ADD COLUMN odds REAL',
-            'ALTER TABLE scores ADD COLUMN balance INTEGER',
-            'ALTER TABLE featured ADD COLUMN match_id INTEGER',
-            'ALTER TABLE featured ADD COLUMN created_at TEXT',
-        ]:
-            _safe(stmt)
-
-
-# ================= ODDS API (The Odds API) =================
-
-        # (patched) odds metadata columns
-        for stmt in [
-            'ALTER TABLE matches ADD COLUMN odds_updated_at TEXT',
-            'ALTER TABLE matches ADD COLUMN odds_source TEXT',
-        ]:
-            _safe(stmt)
-
+        con.commit()
 
 # =========================
 # AI ODDS (ELO-based)
@@ -544,28 +538,6 @@ def ai_odds_for_match(match: dict) -> dict:
     return out
 
 
-# AI odds: ELO ratings table
-cur.execute("""
-CREATE TABLE IF NOT EXISTS team_ratings (
-    sport TEXT,
-    team TEXT,
-    elo INTEGER,
-    updated_at TEXT,
-    PRIMARY KEY (sport, team)
-)
-""")
-# Ensure votes has stake & odds for betting
-def _safe(stmt: str):
-    try:
-        cur.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
-
-for stmt in [
-    "ALTER TABLE votes ADD COLUMN stake INTEGER",
-    "ALTER TABLE votes ADD COLUMN odds REAL",
-]:
-    _safe(stmt)
 
 def _norm_team(s: str) -> str:
     s = (s or "").lower().strip()
@@ -576,6 +548,8 @@ def _norm_team(s: str) -> str:
 
 def _parse_title_teams(title: str) -> tuple[str, str] | None:
     t = (title or "").strip()
+    if not t:
+        return None
     low = t.lower()
     seps = [" vs ", " vs. ", " v ", " — ", " - ", " – "]
     for sep in seps:
@@ -586,14 +560,12 @@ def _parse_title_teams(title: str) -> tuple[str, str] | None:
                 b = parts[1].strip()
                 if a and b:
                     return a, b
-            # dash without spaces like "HAM-RB"
-        m2 = re.match(r"^(.+?)[\-–—](.+)$", t)
-        if m2:
-            a, b = m2.group(1).strip(), m2.group(2).strip()
-            if a and b:
-                return a, b
-
-        return None
+    m2 = re.match(r"^(.+?)[\-–—](.+)$", t)
+    if m2:
+        a, b = m2.group(1).strip(), m2.group(2).strip()
+        if a and b:
+            return a, b
+    return None
 
 async def _odds_api_get_json(session: aiohttp.ClientSession, path: str, params: dict) -> Any:
     url = f"{ODDS_BASE_URL}{path}"
@@ -1533,32 +1505,14 @@ async def cb_back_sports(cb: CallbackQuery):
     await cb.message.answer("⬅️ Назад. Выбери спорт:", reply_markup=ikb_sports(sports))
     await cb.answer()
 
-@dp.callback_query(F.data == "noop")
 
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
 
 # =========================
 # CALLBACKS: OPEN MATCH / STATS / PICK
 # =========================
-
-@dp.callback_query(F.data.startswith("sport:"))
-async def cb_sport_page(cb: CallbackQuery):
-    # sport:{sport}:{page}
-    try:
-        _, sport, page_s = cb.data.split(":")
-        page = int(page_s)
-    except Exception:
-        return await cb.answer("Ошибка.", show_alert=True)
-    await cb.message.edit_reply_markup(reply_markup=ikb_matches_list(sport, page))
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("match:"))
-async def cb_match_open(cb: CallbackQuery):
-    upsert_user_from_message(cb)
-    try:
-        _, mid_s = cb.data.split(":")
-        mid = int(mid_s)
-    except Exception:
-        return await cb.answer("Ошибка.", show_alert=True)
 
     match = get_match(mid)
     if not match:
@@ -1578,78 +1532,6 @@ async def cb_match_open(cb: CallbackQuery):
 
     text = f"🏟 <b>{match['title']}</b>\n🕒 {fmt_dt(match.get('start_time_utc') or match.get('start_time') or '')}{odds_line}\n\nВыбери исход:"
     await cb.message.answer(text, reply_markup=ikb_match_card(mid))
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("stats:"))
-async def cb_stats(cb: CallbackQuery):
-    try:
-        _, mid_s = cb.data.split(":")
-        mid = int(mid_s)
-    except Exception:
-        return await cb.answer("Ошибка.", show_alert=True)
-
-    st = match_stats(mid)
-    total = st["1"] + st["X"] + st["2"]
-    if total == 0:
-        return await cb.answer("Пока нет голосов.", show_alert=True)
-
-    msg = (
-        f"📊 Голоса по матчу #{mid}:\n"
-        f"1: {st['1']}\nX: {st['X']}\n2: {st['2']}\n"
-        f"Всего: {total}"
-    )
-    await cb.answer()
-    await cb.message.answer(msg)
-
-@dp.callback_query(F.data.startswith("pick:"))
-async def cb_pick(cb: CallbackQuery):
-    upsert_user_from_message(cb)
-    try:
-        _, mid_s, pick = cb.data.split(":")
-        mid = int(mid_s)
-    except Exception:
-        return await cb.answer("Ошибка.", show_alert=True)
-
-    if pick not in ("1", "X", "2"):
-        return await cb.answer("Неверный исход.", show_alert=True)
-
-    match = get_match(mid)
-    if not match:
-        return await cb.answer("Матч не найден.", show_alert=True)
-
-    ok, reason = can_predict(match)
-    if not ok:
-        return await cb.answer(reason, show_alert=True)
-
-    # Ensure odds exist (best-effort fetch right now)
-    refreshed = await ensure_odds_for_match(mid)
-    if refreshed:
-        match = refreshed
-
-    odds = match_odds_for_pick(dict(match), pick)
-
-    # For sports without draw odds, hide X
-    if pick == "X" and not odds:
-        return await cb.answer("Для этого матча ничьи нет. Выбери 1 или 2.", show_alert=True)
-
-    if not odds:
-        return await cb.answer(
-            "Коэффициенты пока недоступны для этого матча. "
-            "Админу: /odds_now. Попробуй чуть позже.",
-            show_alert=True,
-        )
-
-    # Store pending pick and show stake options
-    set_pref(cb.from_user.id,
-             awaiting_stake=True,
-             awaiting_custom_stake=False,
-             pending_match_id=mid,
-             pending_pick=pick)
-
-    await cb.message.answer(
-        f"✅ Выбран исход <b>{pick}</b> (кф <b>{float(odds):.2f}</b>).\nВыбери сумму ставки:",
-        reply_markup=ikb_stake_amounts(mid, pick),
-    )
     await cb.answer()
 
 @dp.message(F.text == BTN_TODAY)
@@ -1759,8 +1641,8 @@ async def cb_pick(cb: CallbackQuery):
 
     if BETTING_ENABLED:
         set_pref(cb.from_user.id, pending_match_id=match_id, pending_pick=pick, awaiting_stake=True)
-        odds = match_odds_for_pick(match, pick)
-        kb = stake_keyboard(match_id, pick, odds)
+        odds = match_odds_for_pick(match, pick) or 2.00
+        kb = stake_keyboard(match_id, pick, float(odds))
         await cb.message.answer(
             f"💰 Выбери сумму ставки\n"
             f"Исход: <b>{pick}</b>  |  КФ: <b>{odds:.2f}</b>\n"
