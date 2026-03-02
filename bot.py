@@ -18,7 +18,7 @@ def ikb_stake_amounts(match_id: int, pick: str) -> 'InlineKeyboardMarkup':
 
 
 import os
-print("BOT_ODDS_REAL_FIXED15", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_AI_ODDS_V1", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 
@@ -148,6 +148,12 @@ from aiogram.types import (
 
 # =========================
 # CONFIG
+AI_MARGIN = float(os.getenv('AI_MARGIN', '0.07'))  # 7% bookmaker margin
+ELO_START = int(os.getenv('ELO_START', '1500'))
+ELO_K = int(os.getenv('ELO_K', '20'))
+HOME_ADV_FOOTBALL = int(os.getenv('HOME_ADV_FOOTBALL', '60'))
+HOME_ADV_NHL = int(os.getenv('HOME_ADV_NHL', '45'))
+
 # =========================
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
@@ -277,17 +283,17 @@ def add_balance(user_id: int, delta: int) -> None:
                         (delta, iso(now_utc()), user_id))
             con.commit()
 
-def match_odds_for_pick(match: dict, pick: str) -> float:
-    try:
-        if pick == "1" and match.get("odds_1"):
-            return float(match["odds_1"])
-        if pick == "X" and match.get("odds_x"):
-            return float(match["odds_x"])
-        if pick == "2" and match.get("odds_2"):
-            return float(match["odds_2"])
-    except Exception:
-        pass
+def match_odds_for_pick(match: dict, pick: str) -> float | None:
+    """Return decimal odds for pick ('1','X','2'). Uses internal AI odds."""
+    m = ai_odds_for_match(dict(match))
+    if pick == "1":
+        return m.get("odds_1")
+    if pick == "X":
+        return m.get("odds_x")
+    if pick == "2":
+        return m.get("odds_2")
     return None
+
 def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
@@ -404,6 +410,162 @@ def init_db() -> None:
             'ALTER TABLE matches ADD COLUMN odds_source TEXT',
         ]:
             _safe(stmt)
+
+
+# =========================
+# AI ODDS (ELO-based)
+# =========================
+
+def _sport_key_for_ai(sport: str | None, league: str | None = None) -> str:
+    s = (sport or "").lower()
+    l = (league or "").lower()
+    if "nhl" in s or "nhl" in l or "ice" in s:
+        return "nhl"
+    return "football"
+
+def get_team_elo(sport_key: str, team: str) -> int:
+    team = (team or "").strip()
+    if not team:
+        return ELO_START
+    with db() as con:
+        r = con.execute(
+            "SELECT elo FROM team_ratings WHERE sport=? AND team=?",
+            (sport_key, team),
+        ).fetchone()
+        if r:
+            return int(r[0])
+        con.execute(
+            "INSERT OR REPLACE INTO team_ratings(sport, team, elo, updated_at) VALUES(?,?,?,?)",
+            (sport_key, team, ELO_START, iso(now_utc())),
+        )
+        con.commit()
+    return ELO_START
+
+def set_team_elo(sport_key: str, team: str, elo: int) -> None:
+    team = (team or "").strip()
+    if not team:
+        return
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO team_ratings(sport, team, elo, updated_at) VALUES(?,?,?,?)",
+            (sport_key, team, int(elo), iso(now_utc())),
+        )
+        con.commit()
+
+def _expected_score(elo_a: float, elo_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((elo_b - elo_a) / 400.0))
+
+def update_elo_after_match(sport_key: str, home: str, away: str, result_1x2: str) -> None:
+    """Update ELO after match. result_1x2 is '1','X','2'."""
+    eh = get_team_elo(sport_key, home)
+    ea = get_team_elo(sport_key, away)
+
+    # home advantage applied in expected score only
+    adv = HOME_ADV_NHL if sport_key == "nhl" else HOME_ADV_FOOTBALL
+    exp_home = _expected_score(eh + adv, ea)
+
+    if result_1x2 == "1":
+        s_home = 1.0
+    elif result_1x2 == "2":
+        s_home = 0.0
+    else:
+        s_home = 0.5
+
+    new_eh = round(eh + ELO_K * (s_home - exp_home))
+    new_ea = round(ea + ELO_K * ((1.0 - s_home) - (1.0 - exp_home)))
+
+    set_team_elo(sport_key, home, new_eh)
+    set_team_elo(sport_key, away, new_ea)
+
+def ai_probs_1x2(match: dict) -> tuple[float, float | None, float]:
+    """Returns (p1, px_or_none, p2)."""
+    sport_key = _sport_key_for_ai(match.get("sport"), match.get("league"))
+    home = match.get("home_team") or ""
+    away = match.get("away_team") or ""
+    if not home or not away:
+        # fallback: parse title
+        teams = _parse_title_teams(match.get("title", "")) if "_parse_title_teams" in globals() else None
+        if teams:
+            home, away = teams
+
+    eh = get_team_elo(sport_key, home)
+    ea = get_team_elo(sport_key, away)
+    adv = HOME_ADV_NHL if sport_key == "nhl" else HOME_ADV_FOOTBALL
+    p_home_nd = _expected_score(eh + adv, ea)  # win prob in 2-way
+
+    if sport_key == "nhl":
+        return float(p_home_nd), None, float(1.0 - p_home_nd)
+
+    # Football: add draw probability
+    diff = abs((eh + adv) - ea)
+    # base draw ~0.26, increases when teams close, decreases when mismatch
+    p_draw = 0.20 + 0.12 * (1.0 / (1.0 + (diff / 250.0)))
+    p_draw = max(0.18, min(0.32, p_draw))
+    rem = 1.0 - p_draw
+    p1 = rem * p_home_nd
+    p2 = rem * (1.0 - p_home_nd)
+
+    # safety normalize
+    s = p1 + p_draw + p2
+    return p1 / s, p_draw / s, p2 / s
+
+def probs_to_odds(p1: float, px: float | None, p2: float) -> tuple[float, float | None, float]:
+    """Apply margin and convert to decimal odds."""
+    margin = max(0.0, float(AI_MARGIN))
+    if px is None:
+        # 2-way
+        p1i = p1 * (1.0 + margin)
+        p2i = p2 * (1.0 + margin)
+        o1 = 1.0 / max(1e-6, p1i)
+        o2 = 1.0 / max(1e-6, p2i)
+        return round(max(1.01, min(50.0, o1)), 2), None, round(max(1.01, min(50.0, o2)), 2)
+
+    p1i = p1 * (1.0 + margin)
+    pxi = px * (1.0 + margin)
+    p2i = p2 * (1.0 + margin)
+    o1 = 1.0 / max(1e-6, p1i)
+    ox = 1.0 / max(1e-6, pxi)
+    o2 = 1.0 / max(1e-6, p2i)
+    return (
+        round(max(1.01, min(80.0, o1)), 2),
+        round(max(1.01, min(80.0, ox)), 2),
+        round(max(1.01, min(80.0, o2)), 2),
+    )
+
+def ai_odds_for_match(match: dict) -> dict:
+    p1, px, p2 = ai_probs_1x2(match)
+    o1, ox, o2 = probs_to_odds(p1, px, p2)
+    out = dict(match)
+    out["odds_1"] = o1
+    out["odds_x"] = ox
+    out["odds_2"] = o2
+    out["odds_source"] = "AI"
+    out["odds_updated_at"] = iso(now_utc())
+    return out
+
+
+# AI odds: ELO ratings table
+cur.execute("""
+CREATE TABLE IF NOT EXISTS team_ratings (
+    sport TEXT,
+    team TEXT,
+    elo INTEGER,
+    updated_at TEXT,
+    PRIMARY KEY (sport, team)
+)
+""")
+# Ensure votes has stake & odds for betting
+def _safe(stmt: str):
+    try:
+        cur.execute(stmt)
+    except sqlite3.OperationalError:
+        pass
+
+for stmt in [
+    "ALTER TABLE votes ADD COLUMN stake INTEGER",
+    "ALTER TABLE votes ADD COLUMN odds REAL",
+]:
+    _safe(stmt)
 
 def _norm_team(s: str) -> str:
     s = (s or "").lower().strip()
@@ -625,24 +787,10 @@ async def odds_refresh_loop():
 
 
 async def ensure_odds_for_match(match_id: int) -> dict | None:
-    """Ensure odds are present for a match. If missing, try refreshing odds once."""
     match = get_match(match_id)
     if not match:
         return None
-
-    if match.get("odds_1") or match.get("odds_x") or match.get("odds_2"):
-        return dict(match)
-
-    if not ODDS_API_KEY:
-        return dict(match)
-
-    try:
-        await refresh_odds_once()
-    except Exception:
-        logger.exception("ensure_odds_for_match: refresh_odds_once failed")
-
-    match2 = get_match(match_id)
-    return dict(match2) if match2 else None
+    return ai_odds_for_match(dict(match))
 
 def upsert_user_from_message(m: Message | CallbackQuery) -> None:
     u = m.from_user
@@ -1323,15 +1471,7 @@ async def sync_cmd(m: Message):
 async def odds_now_cmd(m: Message):
     if m.from_user.id != ADMIN_ID:
         return await m.answer("Недостаточно прав.")
-    if not ODDS_API_KEY:
-        return await m.answer("ODDS_API_KEY не задан в ENV.")
-    await m.answer("Обновляю коэффициенты...")
-    try:
-        init_db()
-        n = await refresh_odds_once()
-        await m.answer(f"✅ Готово. Обновлено матчей: {n}")
-    except Exception as e:
-        await m.answer(f"❌ Ошибка: {e}")
+    await m.answer("Odds API отключён. Коэффициенты считаются внутренним AI (ELO) автоматически.")
 
 @dp.message(F.text == BTN_ACTIVE)
 async def active_matches(m: Message):
@@ -1990,8 +2130,6 @@ async def on_custom_stake_amount(m: Message):
 
 async def main():
     init_db()
-    if ODDS_API_KEY:
-        asyncio.create_task(odds_refresh_loop())
     asyncio.create_task(weekly_bonus_loop())
 
     # For Render Web Service: keep port open (health endpoint)
