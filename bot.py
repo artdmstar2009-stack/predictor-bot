@@ -18,7 +18,7 @@ def ikb_stake_amounts(match_id: int, pick: str) -> 'InlineKeyboardMarkup':
 
 
 import os
-print("BOT_AI_CLEAN_FULL_V2", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_AI_FORM_V2", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 
@@ -404,6 +404,33 @@ def init_db() -> None:
         )
         """)
 
+        # Team form history (last matches) for AI odds
+
+        cur.execute("""
+
+        CREATE TABLE IF NOT EXISTS team_form (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            sport TEXT,
+
+            team TEXT,
+
+            match_time TEXT,
+
+            result TEXT,          -- 'W','D','L'
+
+            gf INTEGER,
+
+            ga INTEGER
+
+        )
+
+        """)
+
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_team_form ON team_form(sport, team, match_time)")
+
+
         con.commit()
 
 # =========================
@@ -481,17 +508,24 @@ def ai_probs_1x2(match: dict) -> tuple[float, float | None, float]:
         teams = _parse_title_teams(match.get("title", "")) if "_parse_title_teams" in globals() else None
         if teams:
             home, away = teams
-
     eh = get_team_elo(sport_key, home)
     ea = get_team_elo(sport_key, away)
+
+    fb_home = get_form_bonus(sport_key, home, 5)
+    fb_away = get_form_bonus(sport_key, away, 5)
+
     adv = HOME_ADV_NHL if sport_key == "nhl" else HOME_ADV_FOOTBALL
-    p_home_nd = _expected_score(eh + adv, ea)  # win prob in 2-way
+
+    eh_adj = eh + adv + fb_home - fb_away
+    ea_adj = ea + fb_away - fb_home
+
+    p_home_nd = _expected_score(eh_adj, ea_adj)  # win prob in 2-way
 
     if sport_key == "nhl":
         return float(p_home_nd), None, float(1.0 - p_home_nd)
 
     # Football: add draw probability
-    diff = abs((eh + adv) - ea)
+    diff = abs(eh_adj - ea_adj)
     # base draw ~0.26, increases when teams close, decreases when mismatch
     p_draw = 0.20 + 0.12 * (1.0 / (1.0 + (diff / 250.0)))
     p_draw = max(0.18, min(0.32, p_draw))
@@ -538,6 +572,69 @@ def ai_odds_for_match(match: dict) -> dict:
     return out
 
 
+
+# =========================
+# TEAM FORM (last 5)
+# =========================
+
+def add_team_form_record(sport_key: str, team: str, match_time: datetime, result: str, gf: int | None, ga: int | None) -> None:
+    team = (team or "").strip()
+    if not team:
+        return
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO team_form(sport, team, match_time, result, gf, ga) VALUES(?,?,?,?,?,?)",
+            (sport_key, team, iso(match_time), result, int(gf or 0), int(ga or 0)),
+        )
+        # keep db small: keep last 40 rows per team
+        cur.execute(
+            """
+            DELETE FROM team_form
+            WHERE id IN (
+                SELECT id FROM team_form
+                WHERE sport=? AND team=?
+                ORDER BY match_time DESC
+                LIMIT -1 OFFSET 40
+            )
+            """,
+            (sport_key, team),
+        )
+        con.commit()
+
+def get_team_last_form(sport_key: str, team: str, n: int = 5) -> list[sqlite3.Row]:
+    team = (team or "").strip()
+    if not team:
+        return []
+    with db() as con:
+        return con.execute(
+            "SELECT result, gf, ga FROM team_form WHERE sport=? AND team=? ORDER BY match_time DESC LIMIT ?",
+            (sport_key, team, int(n)),
+        ).fetchall()
+
+def get_form_bonus(sport_key: str, team: str, n: int = 5) -> int:
+    """Return ELO-like bonus based on last N matches. Range примерно [-120..+120]."""
+    rows = get_team_last_form(sport_key, team, n)
+    if not rows:
+        return 0
+
+    pts = 0
+    gd = 0
+    for r in rows:
+        res = (r["result"] or "").upper()
+        if res == "W":
+            pts += 1
+        elif res == "L":
+            pts -= 1
+        try:
+            gf = int(r["gf"] or 0)
+            ga = int(r["ga"] or 0)
+            gd += (gf - ga)
+        except Exception:
+            pass
+
+    bonus = pts * 25 + max(-10, min(10, gd)) * 8
+    return int(max(-120, min(120, bonus)))
 
 def _norm_team(s: str) -> str:
     s = (s or "").lower().strip()
@@ -1011,6 +1108,8 @@ class SyncedMatch:
 @dataclass
 class FinishedInfo:
     result_1x2: str
+    home_score: int | None = None
+    away_score: int | None = None
 
 async def http_json(session: aiohttp.ClientSession, url: str, headers: Optional[Dict[str, str]] = None, timeout_s: int = 20) -> Any:
     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
@@ -1065,18 +1164,18 @@ async def football_result(session: aiohttp.ClientSession, external_id: str) -> O
     if hg is None or ag is None:
         winner = score.get("winner")
         if winner == "HOME_TEAM":
-            return FinishedInfo("1")
+            return FinishedInfo("1", hg, ag)
         if winner == "AWAY_TEAM":
-            return FinishedInfo("2")
+            return FinishedInfo("2", hg, ag)
         if winner == "DRAW":
-            return FinishedInfo("X")
+            return FinishedInfo("X", hg, ag)
         return None
     hg = int(hg); ag = int(ag)
     if hg > ag:
-        return FinishedInfo("1")
+        return FinishedInfo("1", hg, ag)
     if hg < ag:
-        return FinishedInfo("2")
-    return FinishedInfo("X")
+        return FinishedInfo("2", hg, ag)
+    return FinishedInfo("X", hg, ag)
 
 async def nhl_list(session: aiohttp.ClientSession, date_from: datetime, date_to: datetime) -> List[SyncedMatch]:
     if not NHL_ENABLED:
@@ -1138,10 +1237,10 @@ async def nhl_result(session: aiohttp.ClientSession, external_id: str) -> Option
             return None
         hs = int(hs); a_s = int(a_s)
         if hs > a_s:
-            return FinishedInfo("1")
+            return FinishedInfo("1", hs, a_s)
         if hs < a_s:
-            return FinishedInfo("2")
-        return FinishedInfo("X")
+            return FinishedInfo("2", hs, a_s)
+        return FinishedInfo("X", hs, a_s)
     except Exception:
         return None
 
@@ -1216,7 +1315,7 @@ def pick_featured_for_today() -> Optional[int]:
         return mid
 
 
-async def apply_scoring_for_match(match_id: int, result_1x2: str) -> None:
+async def apply_scoring_for_match(match_id: int, result_1x2: str, home_score: int | None = None, away_score: int | None = None) -> None:
     """Closes match, updates points, handles betting payouts, notifies users."""
     notifications: list[tuple[int, str]] = []
     with db() as con:
@@ -1226,6 +1325,26 @@ async def apply_scoring_for_match(match_id: int, result_1x2: str) -> None:
             return
 
         cur.execute("UPDATE matches SET result=?, status='closed' WHERE id=?", (result_1x2, match_id))
+        # AI ratings update (ELO + form)
+        try:
+            mrow = cur.execute("SELECT sport, league, title FROM matches WHERE id=?", (match_id,)).fetchone()
+            sport_key = _sport_key_for_ai((mrow["sport"] if mrow else ""), (mrow["league"] if mrow else ""))
+            teams = _parse_title_teams(((mrow["title"] if mrow else "") or (st["title"] or "")) or "")
+            if teams:
+                home, away = teams
+                update_elo_after_match(sport_key, home, away, result_1x2)
+                if home_score is not None and away_score is not None:
+                    mt = now_utc()
+                    if result_1x2 == "1":
+                        rh, ra = "W", "L"
+                    elif result_1x2 == "2":
+                        rh, ra = "L", "W"
+                    else:
+                        rh = ra = "D"
+                    add_team_form_record(sport_key, home, mt, rh, int(home_score), int(away_score))
+                    add_team_form_record(sport_key, away, mt, ra, int(away_score), int(home_score))
+        except Exception:
+            logger.exception("AI update failed")
 
         votes = cur.execute(
             "SELECT user_id, pick, COALESCE(stake,0) AS stake, COALESCE(odds,0) AS odds FROM votes WHERE match_id=?",
@@ -1349,7 +1468,7 @@ async def auto_results_loop():
                     if not fin:
                         continue
 
-                    await apply_scoring_for_match(mid, fin.result_1x2)
+                    await apply_scoring_for_match(mid, fin.result_1x2, fin.home_score, fin.away_score)
 
                     if ADMIN_ID:
                         try:
@@ -2009,6 +2128,23 @@ async def on_custom_stake_amount(m: Message):
     # Place bet
     set_pref(m.from_user.id, awaiting_custom_stake=False)
     await place_bet(m.from_user.id, int(match_id), str(pick), stake, m)
+
+# =========================
+# SECRET ADMIN COMMAND (balance +5000)
+# =========================
+@dp.message(Command("secret_add5000"))
+async def secret_add5000(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return  # silently ignore for others
+
+    upsert_user_from_message(m)
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("UPDATE scores SET balance = COALESCE(balance,0) + 5000 WHERE user_id=?", (m.from_user.id,))
+        con.commit()
+
+    await m.answer("💰 +5000 баллов начислено на баланс (тестовая команда).")
+
 
 async def main():
     init_db()
