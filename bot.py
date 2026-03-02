@@ -1,6 +1,24 @@
 
+def ikb_stake_amounts(match_id: int, pick: str) -> InlineKeyboardMarkup:
+    """Keyboard for stake selection."""
+    # Common stake sizes; you can change later
+    amounts = [50, 100, 200, 500, 1000]
+    rows: list[list[InlineKeyboardButton]] = []
+    # 2 per row
+    for i in range(0, len(amounts), 2):
+        row = []
+        for amt in amounts[i:i+2]:
+            row.append(InlineKeyboardButton(text=f"{amt}💰", callback_data=f"stake:{match_id}:{pick}:{amt}"))
+        rows.append(row)
+    # custom amount
+    rows.append([InlineKeyboardButton(text="✍️ Другая сумма", callback_data=f"stake_custom:{match_id}:{pick}")])
+    # back to match
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к матчу", callback_data=f"match:{match_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 import os
-print("BOT_ODDS_REAL_FIXED11", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_ODDS_REAL_FIXED13", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 def acquire_polling_lock() -> bool:
@@ -603,6 +621,27 @@ async def odds_refresh_loop():
         except Exception as e:
             logger.exception("odds_refresh_loop error: %s", e)
         await asyncio.sleep(max(60, ODDS_REFRESH_INTERVAL))
+
+
+async def ensure_odds_for_match(match_id: int) -> dict | None:
+    """Ensure odds are present for a match. If missing, try refreshing odds once."""
+    match = get_match(match_id)
+    if not match:
+        return None
+
+    if match.get("odds_1") or match.get("odds_x") or match.get("odds_2"):
+        return dict(match)
+
+    if not ODDS_API_KEY:
+        return dict(match)
+
+    try:
+        await refresh_odds_once()
+    except Exception:
+        logger.exception("ensure_odds_for_match: refresh_odds_once failed")
+
+    match2 = get_match(match_id)
+    return dict(match2) if match2 else None
 
 def upsert_user_from_message(m: Message | CallbackQuery) -> None:
     u = m.from_user
@@ -1908,6 +1947,37 @@ async def weekly_bonus_loop():
         except Exception as e:
             logger.exception("weekly_bonus_loop error: %s", e)
             await asyncio.sleep(60)
+
+
+@dp.message()
+async def on_custom_stake_amount(m: Message):
+    # This handler only triggers when user is awaiting a custom stake
+    try:
+        prefs = get_pref(m.from_user.id)
+    except Exception:
+        prefs = {}
+    if not prefs or not prefs.get("awaiting_custom_stake"):
+        return  # let other handlers work
+
+    text = (m.text or "").strip()
+    if not text.isdigit():
+        return await m.answer("Нужна сумма числом. Пример: 250")
+
+    stake = int(text)
+    if stake <= 0:
+        return await m.answer("Сумма должна быть > 0.")
+    if stake > 1_000_000:
+        return await m.answer("Слишком большая сумма.")
+
+    match_id = prefs.get("pending_match_id")
+    pick = prefs.get("pending_pick")
+    if not match_id or not pick:
+        set_pref(m.from_user.id, awaiting_custom_stake=False, pending_match_id=None, pending_pick=None)
+        return await m.answer("Не вижу выбранный матч/исход. Открой матч заново.")
+
+    # Place bet
+    set_pref(m.from_user.id, awaiting_custom_stake=False)
+    await place_bet(m.from_user.id, int(match_id), str(pick), stake, m)
 
 async def main():
     init_db()
