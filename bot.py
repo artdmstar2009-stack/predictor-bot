@@ -18,7 +18,7 @@ def ikb_stake_amounts(match_id: int, pick: str) -> 'InlineKeyboardMarkup':
 
 
 import os
-print("BOT_ODDS_REAL_FIXED14B", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_ODDS_REAL_FIXED15", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 
@@ -1481,27 +1481,35 @@ async def cb_pick(cb: CallbackQuery):
     if not ok:
         return await cb.answer(reason, show_alert=True)
 
-    odds = match_odds_for_pick(dict(match), pick)
-    if not odds:
-        # try refresh quickly for admin convenience
-        if ODDS_API_KEY:
-            try:
-                await cb.answer("Коэффициенты обновляются, попробуй ещё раз через минуту.", show_alert=True)
-            except Exception:
-                pass
-        else:
-            await cb.answer("Коэффициенты недоступны.", show_alert=True)
-        return
+    # Ensure odds exist (best-effort fetch right now)
+    refreshed = await ensure_odds_for_match(mid)
+    if refreshed:
+        match = refreshed
 
-    # store pending pick and show stake options
-    set_pref(cb.from_user.id, awaiting_stake=True, awaiting_custom_stake=False, pending_match_id=mid, pending_pick=pick)
+    odds = match_odds_for_pick(dict(match), pick)
+
+    # For sports without draw odds, hide X
+    if pick == "X" and not odds:
+        return await cb.answer("Для этого матча ничьи нет. Выбери 1 или 2.", show_alert=True)
+
+    if not odds:
+        return await cb.answer(
+            "Коэффициенты пока недоступны для этого матча. "
+            "Админу: /odds_now. Попробуй чуть позже.",
+            show_alert=True,
+        )
+
+    # Store pending pick and show stake options
+    set_pref(cb.from_user.id,
+             awaiting_stake=True,
+             awaiting_custom_stake=False,
+             pending_match_id=mid,
+             pending_pick=pick)
+
     await cb.message.answer(
         f"✅ Выбран исход <b>{pick}</b> (кф <b>{float(odds):.2f}</b>).\nВыбери сумму ставки:",
         reply_markup=ikb_stake_amounts(mid, pick),
     )
-    await cb.answer()
-
-async def cb_noop(cb: CallbackQuery):
     await cb.answer()
 
 @dp.message(F.text == BTN_TODAY)
