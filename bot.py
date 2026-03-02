@@ -1,5 +1,5 @@
 
-def ikb_stake_amounts(match_id: int, pick: str) -> InlineKeyboardMarkup:
+def ikb_stake_amounts(match_id: int, pick: str) -> 'InlineKeyboardMarkup':
     """Keyboard for stake selection."""
     # Common stake sizes; you can change later
     amounts = [50, 100, 200, 500, 1000]
@@ -18,7 +18,8 @@ def ikb_stake_amounts(match_id: int, pick: str) -> InlineKeyboardMarkup:
 
 
 import os
-print("BOT_ODDS_REAL_FIXED13", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_ODDS_REAL_FIXED14B", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+
 
 
 def acquire_polling_lock() -> bool:
@@ -1653,7 +1654,7 @@ async def cb_stake_cancel(cb: CallbackQuery):
     await cb.answer("Отменено.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("stake_custom:"))
-async def cb_stake_custom(cb: CallbackQuery):
+async def cb_stake_custom(cb: 'CallbackQuery'):
     upsert_user_from_message(cb)
     try:
         _, match_id_s, pick = cb.data.split(":")
