@@ -148,6 +148,9 @@ from aiogram.types import (
 
 # =========================
 # CONFIG
+MATCH_LIST_LIMIT = int(os.getenv('MATCH_LIST_LIMIT', '20'))
+AUTOSYNC_INTERVAL_MIN = int(os.getenv('AUTOSYNC_INTERVAL_MIN', '30'))
+
 AI_MARGIN = float(os.getenv('AI_MARGIN', '0.07'))  # 7% bookmaker margin
 ELO_START = int(os.getenv('ELO_START', '1500'))
 ELO_K = int(os.getenv('ELO_K', '20'))
@@ -2164,9 +2167,71 @@ async def secret_whoami(m: Message):
     await m.answer(f"ADMIN_ID={ADMIN_ID}\nYOUR_ID={m.from_user.id}")
 
 
+
+# =========================
+# AUTO ARCHIVE OLD MATCHES
+# =========================
+from datetime import datetime, timezone, timedelta
+
+def msk_day_start_utc(now=None):
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(DISPLAY_ZONE)
+    local_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_start.astimezone(timezone.utc)
+
+def archive_old_matches():
+    cutoff = msk_day_start_utc()
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "UPDATE matches SET status='archived' WHERE start_time_utc < ? AND status!='archived'",
+            (cutoff.isoformat(),)
+        )
+        con.commit()
+        return cur.rowcount
+
+async def daily_rollover_loop():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            local = now.astimezone(DISPLAY_ZONE)
+
+            run_local = local.replace(hour=0, minute=10, second=0, microsecond=0)
+            if run_local <= local:
+                run_local = run_local + timedelta(days=1)
+
+            run_utc = run_local.astimezone(timezone.utc)
+            wait = (run_utc - now).total_seconds()
+            await asyncio.sleep(max(5, int(wait)))
+
+            n = archive_old_matches()
+            logger.info(f"Archived old matches: {n}")
+
+        except Exception:
+            logger.exception("daily_rollover_loop error")
+            await asyncio.sleep(60)
+
+async def periodic_autosync_loop():
+    """Runs autosync every AUTOSYNC_INTERVAL_MIN minutes."""
+    while True:
+        try:
+            await asyncio.sleep(max(60, AUTOSYNC_INTERVAL_MIN * 60))
+            fn = globals().get("autosync_once")
+            if fn:
+                res = fn()
+                if asyncio.iscoroutine(res):
+                    await res
+            logger.info("Periodic autosync done")
+        except Exception:
+            logger.exception("periodic_autosync_loop error")
+            await asyncio.sleep(60)
+
+
 async def main():
     init_db()
     asyncio.create_task(weekly_bonus_loop())
+    asyncio.create_task(daily_rollover_loop())
+    asyncio.create_task(periodic_autosync_loop())
 
     # For Render Web Service: keep port open (health endpoint)
     asyncio.create_task(start_web_server())
