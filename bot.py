@@ -1400,13 +1400,32 @@ async def apply_scoring_for_match(match_id: int, result_1x2: str, home_score: in
                     profit = -stake
 
                 title = st["title"] or "Матч"
+                teams = _parse_title_teams(title)
+                home_name = teams[0] if teams else "Хозяева"
+                away_name = teams[1] if teams else "Гости"
+
+                score_txt = ""
+                if home_score is not None and away_score is not None:
+                    score_txt = f"\nСчёт: <b>{home_score}:{away_score}</b>"
+
+                if result_1x2 == "1":
+                    winner_txt = f"🏆 Победа: <b>{home_name}</b>"
+                elif result_1x2 == "2":
+                    winner_txt = f"🏆 Победа: <b>{away_name}</b>"
+                else:
+                    winner_txt = "🤝 Ничья"
+
+                outcome_txt = "✅ Выигрыш" if correct else "❌ Проигрыш"
+                profit_txt = f"<b>{profit:+d}</b>"
+
                 msg = (
                     f"🏁 Итог матча: <b>{title}</b>\n"
-                    f"Результат 1X2: <b>{result_1x2}</b>\n"
-                    f"Твой выбор: <b>{pick}</b>\n"
-                    f"Ставка: <b>{stake}</b> | КФ: <b>{odds:.2f}</b>\n"
-                    f"{'✅ Выигрыш' if correct else '❌ Проигрыш'}: <b>{profit}</b>"
+                    f"{winner_txt}{score_txt}\n"
+                    f"Твой выбор: <b>{pick}</b> | КФ: <b>{odds:.2f}</b>\n"
+                    f"Ставка: <b>{stake}</b>\n"
+                    f"{outcome_txt}: {profit_txt}"
                 )
+
                 notifications.append((uid, msg))
 
         con.commit()
@@ -1475,7 +1494,7 @@ async def auto_results_loop():
 
                     if ADMIN_ID:
                         try:
-                            await bot.send_message(ADMIN_ID, f"✅ Итог проставлен: {fin.result_1x2}")
+                            await bot.send_message(ADMIN_ID, f"✅ Матч закрыт: {fin.result_1x2} (id={mid})")
                         except Exception:
                             pass
 
