@@ -2246,6 +2246,11 @@ async def periodic_autosync_loop():
             await asyncio.sleep(60)
 
 
+@dp.message(Command("ping"))
+async def cmd_ping(m: Message):
+    await m.answer("pong ✅")
+
+
 async def main():
     init_db()
     asyncio.create_task(weekly_bonus_loop())
