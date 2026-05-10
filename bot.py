@@ -1020,41 +1020,56 @@ def get_open_sports() -> List[Tuple[str, int]]:
             SELECT COALESCE(NULLIF(LOWER(sport), ''), 'other') AS sport, COUNT(*) AS c
             FROM matches
             WHERE status='open'
+              AND COALESCE(start_time_utc, start_time) >= ?
             GROUP BY COALESCE(NULLIF(LOWER(sport), ''), 'other')
             ORDER BY c DESC
-        """).fetchall()
+        """, (iso(_today_msk_start_utc()),)).fetchall()
     return [(r["sport"], int(r["c"])) for r in rows]
 
+
 def count_open_matches(sport: str) -> int:
+    cutoff = iso(_today_msk_start_utc())
     with db() as con:
         if sport == "all":
-            r = con.execute("SELECT COUNT(*) c FROM matches WHERE status='open'").fetchone()
+            r = con.execute(
+                "SELECT COUNT(*) c FROM matches WHERE status='open' AND COALESCE(start_time_utc, start_time) >= ?",
+                (cutoff,),
+            ).fetchone()
         else:
             r = con.execute("""
                 SELECT COUNT(*) c FROM matches
-                WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
-            """, (sport,)).fetchone()
+                WHERE status='open'
+                  AND COALESCE(start_time_utc, start_time) >= ?
+                  AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
+            """, (cutoff, sport)).fetchone()
     return int(r["c"]) if r else 0
+
 
 def get_open_matches_page(sport: str, page: int) -> List[sqlite3.Row]:
     offset = max(0, page) * PER_PAGE
+    cutoff = iso(_today_msk_start_utc())
+    limit = int(globals().get("MATCH_LIST_LIMIT", PER_PAGE))
     with db() as con:
         if sport == "all":
             return con.execute("""
                 SELECT id, title, start_time_utc, league, sport, start_time
                 FROM matches
                 WHERE status='open'
+                  AND COALESCE(start_time_utc, start_time) >= ?
                 ORDER BY COALESCE(start_time_utc, start_time) ASC
                 LIMIT ? OFFSET ?
-            """, (PER_PAGE, offset)).fetchall()
+            """, (cutoff, limit, offset)).fetchall()
 
         return con.execute("""
             SELECT id, title, start_time_utc, league, sport, start_time
             FROM matches
-            WHERE status='open' AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
+            WHERE status='open'
+              AND COALESCE(start_time_utc, start_time) >= ?
+              AND COALESCE(NULLIF(LOWER(sport), ''), 'other')=?
             ORDER BY COALESCE(start_time_utc, start_time) ASC
             LIMIT ? OFFSET ?
-        """, (sport, PER_PAGE, offset)).fetchall()
+        """, (cutoff, sport, limit, offset)).fetchall()
+
 
 def get_match(match_id: int) -> Optional[sqlite3.Row]:
     with db() as con:
@@ -1440,11 +1455,12 @@ async def autosync_loop():
     while True:
         try:
             if SYNC_ENABLED:
-                await autosync_once()
-                pick_featured_for_today()
+                msg = await fixed_sync_once()
+                logger.info("autosync_loop: %s", msg)
         except Exception as e:
             logger.exception("autosync_loop error: %s", e)
         await asyncio.sleep(max(300, SYNC_INTERVAL))
+
 
 async def auto_results_loop():
     async with aiohttp.ClientSession() as session:
@@ -2300,6 +2316,113 @@ async def cmd_ping(m: Message):
 
 
 # =========================
+# FIXED SYNC + AI ODDS PIPELINE
+# =========================
+
+def _match_start_value(row) -> str:
+    try:
+        return (row["start_time_utc"] or row["start_time"] or "").strip()
+    except Exception:
+        return ""
+
+def _today_msk_start_utc() -> datetime:
+    local = now_utc().astimezone(DISPLAY_ZONE)
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc)
+
+def archive_past_matches() -> int:
+    """Archive matches older than today's 00:00 MSK. Keeps history and votes safe."""
+    cutoff = iso(_today_msk_start_utc())
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            """
+            UPDATE matches
+            SET status='archived'
+            WHERE status='open'
+              AND COALESCE(start_time_utc, start_time) < ?
+            """,
+            (cutoff,),
+        )
+        con.commit()
+        return int(cur.rowcount or 0)
+
+def refresh_ai_odds_for_open_matches() -> int:
+    """Recalculate internal AI odds for every open match and store them in DB."""
+    updated = 0
+    with db() as con:
+        cur = con.cursor()
+        rows = cur.execute(
+            """
+            SELECT *
+            FROM matches
+            WHERE status='open'
+              AND COALESCE(start_time_utc, start_time) >= ?
+            ORDER BY COALESCE(start_time_utc, start_time) ASC
+            """,
+            (iso(_today_msk_start_utc()),),
+        ).fetchall()
+
+        for r in rows:
+            try:
+                odds_match = ai_odds_for_match(dict(r))
+                cur.execute(
+                    """
+                    UPDATE matches
+                    SET odds_1=?,
+                        odds_x=?,
+                        odds_2=?,
+                        odds_updated_at=?,
+                        odds_source='AI'
+                    WHERE id=?
+                    """,
+                    (
+                        odds_match.get("odds_1"),
+                        odds_match.get("odds_x"),
+                        odds_match.get("odds_2"),
+                        iso(now_utc()),
+                        int(r["id"]),
+                    ),
+                )
+                updated += 1
+            except Exception:
+                logger.exception("AI odds refresh failed for match id=%s", r["id"])
+        con.commit()
+    return updated
+
+async def fixed_sync_once() -> str:
+    """One reliable sync cycle: archive old -> sync sources -> recalc AI odds -> pick featured."""
+    archived = archive_past_matches()
+
+    sync_msg = ""
+    try:
+        sync_msg = await autosync_once()
+    except Exception as e:
+        logger.exception("autosync_once failed")
+        sync_msg = f"sync error: {e}"
+
+    odds_updated = refresh_ai_odds_for_open_matches()
+
+    try:
+        pick_featured_for_today()
+    except Exception:
+        logger.exception("pick_featured_for_today failed")
+
+    return f"archived={archived}; {sync_msg}; ai_odds={odds_updated}"
+
+async def fixed_periodic_sync_loop():
+    """Regular sync every AUTOSYNC_INTERVAL_MIN minutes."""
+    while True:
+        try:
+            await asyncio.sleep(max(60, AUTOSYNC_INTERVAL_MIN * 60))
+            msg = await fixed_sync_once()
+            logger.info("Fixed periodic sync: %s", msg)
+        except Exception:
+            logger.exception("fixed_periodic_sync_loop error")
+            await asyncio.sleep(60)
+
+
+# =========================
 # ADMIN SYNC COMMAND
 # =========================
 @dp.message(Command("sync_now"))
@@ -2307,26 +2430,32 @@ async def sync_now_cmd(m: Message):
     if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
         return await m.answer("Недостаточно прав.")
 
-    await m.answer("🔄 Синхронизация матчей...")
+    await m.answer("🔄 Обновляю матчи и AI-коэффициенты...")
 
     try:
-        fn = globals().get("autosync_once")
-        if fn:
-            result = fn()
-            if asyncio.iscoroutine(result):
-                await result
-
-        await m.answer("✅ Матчи успешно обновлены.")
+        msg = await fixed_sync_once()
+        await m.answer(f"✅ Синхронизация завершена.\n<code>{msg}</code>")
     except Exception as e:
         logger.exception("sync_now error")
         await m.answer(f"❌ Ошибка синхронизации: {e}")
+
+
+@dp.message(Command("ai_odds_refresh"))
+async def ai_odds_refresh_cmd(m: Message):
+    if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
+        return await m.answer("Недостаточно прав.")
+    try:
+        n = refresh_ai_odds_for_open_matches()
+        await m.answer(f"✅ AI-коэффициенты пересчитаны для матчей: {n}")
+    except Exception as e:
+        logger.exception("ai_odds_refresh error")
+        await m.answer(f"❌ Ошибка: {e}")
 
 
 async def main():
     init_db()
     asyncio.create_task(weekly_bonus_loop())
     asyncio.create_task(daily_rollover_loop())
-    asyncio.create_task(periodic_autosync_loop())
 
     # For Render Web Service: keep port open (health endpoint)
     asyncio.create_task(start_web_server())
