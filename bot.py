@@ -2299,6 +2299,29 @@ async def cmd_ping(m: Message):
     await m.answer("pong ✅")
 
 
+# =========================
+# ADMIN SYNC COMMAND
+# =========================
+@dp.message(Command("sync_now"))
+async def sync_now_cmd(m: Message):
+    if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
+        return await m.answer("Недостаточно прав.")
+
+    await m.answer("🔄 Синхронизация матчей...")
+
+    try:
+        fn = globals().get("autosync_once")
+        if fn:
+            result = fn()
+            if asyncio.iscoroutine(result):
+                await result
+
+        await m.answer("✅ Матчи успешно обновлены.")
+    except Exception as e:
+        logger.exception("sync_now error")
+        await m.answer(f"❌ Ошибка синхронизации: {e}")
+
+
 async def main():
     init_db()
     asyncio.create_task(weekly_bonus_loop())
