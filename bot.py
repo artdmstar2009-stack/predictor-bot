@@ -2068,6 +2068,7 @@ async def profile(m: Message):
         "👤 <b>Профиль</b>\n\n"
         f"Игрок: {pretty_user(m.from_user.id)}\n"
         f"Очки: <b>{int(s['points'])}</b>\n"
+        f"Баланс: <b>{int(s['balance'] or 0)}</b>\n"
         f"Победы: <b>{int(s['correct'])}</b> / Игр: <b>{int(s['total'])}</b>\n"
         f"Серия: <b>{int(s['streak'])}</b> (лучшая {int(s['best_streak'])})\n",
         reply_markup=main_menu(),
@@ -2121,6 +2122,55 @@ async def weekly_bonus_loop():
             await asyncio.sleep(60)
 
 
+# =========================
+# SECRET ADMIN COMMANDS
+# =========================
+@dp.message(Command("secret_add5000"))
+async def secret_add5000(m: Message):
+    if not m.from_user:
+        return
+
+    if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
+        return await m.answer("Недостаточно прав.")
+
+    init_db()
+    upsert_user_from_message(m)
+
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO scores(user_id, points, balance, correct, total, streak, best_streak, updated_at) "
+            "VALUES(?, 0, 0, 0, 0, 0, 0, ?)",
+            (m.from_user.id, iso(now_utc())),
+        )
+        cur.execute(
+            "UPDATE scores SET balance = COALESCE(balance, 0) + 5000, updated_at=? WHERE user_id=?",
+            (iso(now_utc()), m.from_user.id),
+        )
+        row = cur.execute("SELECT balance FROM scores WHERE user_id=?", (m.from_user.id,)).fetchone()
+        con.commit()
+
+    balance = int(row["balance"] if row and row["balance"] is not None else 0)
+    await m.answer(f"💰 +5000 начислено. Баланс теперь: <b>{balance}</b>")
+
+@dp.message(Command("secret_balance"))
+async def secret_balance(m: Message):
+    if not m.from_user:
+        return
+
+    if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
+        return await m.answer("Недостаточно прав.")
+
+    init_db()
+    upsert_user_from_message(m)
+
+    with db() as con:
+        row = con.execute("SELECT balance FROM scores WHERE user_id=?", (m.from_user.id,)).fetchone()
+
+    balance = int(row["balance"] if row and row["balance"] is not None else 0)
+    await m.answer(f"💰 Баланс: <b>{balance}</b>")
+
+
 @dp.message()
 async def on_custom_stake_amount(m: Message):
     # This handler only triggers when user is awaiting a custom stake
@@ -2151,9 +2201,7 @@ async def on_custom_stake_amount(m: Message):
     set_pref(m.from_user.id, awaiting_custom_stake=False)
     await place_bet(m.from_user.id, int(match_id), str(pick), stake, m)
 
-# =========================
-# SECRET ADMIN COMMAND (balance +5000)
-# =========================
+
 @dp.message(Command("secret_add5000"))
 async def secret_add5000(m: Message):
     # secret admin-only command: silently ignore everyone else
