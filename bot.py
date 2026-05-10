@@ -212,6 +212,8 @@ ODDS_PROVIDER = os.getenv("ODDS_PROVIDER", "none").lower()  # 'theoddsapi' or 'n
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+DISPLAY_TZ = os.getenv('DISPLAY_TZ', 'Europe/Moscow')
+DISPLAY_ZONE = ZoneInfo(DISPLAY_TZ)
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("predictor_bot")
 
