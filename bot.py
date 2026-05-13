@@ -18,7 +18,7 @@ def ikb_stake_amounts(match_id: int, pick: str) -> 'InlineKeyboardMarkup':
 
 
 import os
-print("BOT_AI_FORM_V3", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
+print("BOT_FOOTBALL_DEBUG_FIX", "ODDS_LOOKAHEAD_HOURS=", os.getenv("ODDS_LOOKAHEAD_HOURS", "72"))
 
 
 
@@ -2273,7 +2273,26 @@ async def secret_balance(m: Message):
     await m.answer(f"💰 Баланс: <b>{balance}</b>")
 
 
-@dp.message()
+@dp.message(Command("football_debug"))
+async def football_debug_cmd(m: Message):
+    if not m.from_user:
+        return
+
+    if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
+        return await m.answer("Недостаточно прав.")
+
+    msg = (
+        f"FOOTBALL_ENABLED={FOOTBALL_ENABLED}\n"
+        f"FOOTBALL_DATA_TOKEN={'есть' if bool(FOOTBALL_DATA_TOKEN) else 'нет'}\n"
+        f"FOOTBALL_COMPETITIONS={','.join(FOOTBALL_COMPETITIONS)}\n"
+        f"FOOTBALL_BASE={FOOTBALL_BASE}\n"
+        f"DISPLAY_TZ={globals().get('DISPLAY_TZ', 'Europe/Moscow')}\n"
+        f"SYNC_LOOKAHEAD_DAYS={SYNC_LOOKAHEAD_DAYS}"
+    )
+    await m.answer(f"<pre>{msg}</pre>")
+
+
+@dp.message(lambda m: bool(getattr(m, "text", None)) and m.from_user and get_pref(m.from_user.id, "awaiting_custom_stake", False))
 async def on_custom_stake_amount(m: Message):
     # This handler only triggers when user is awaiting a custom stake
     try:
@@ -2537,20 +2556,6 @@ async def ai_odds_refresh_cmd(m: Message):
         logger.exception("ai_odds_refresh error")
         await m.answer(f"❌ Ошибка: {e}")
 
-
-@dp.message(Command("football_debug"))
-async def football_debug_cmd(m: Message):
-    if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
-        return await m.answer("Недостаточно прав.")
-
-    msg = (
-        f"FOOTBALL_ENABLED={FOOTBALL_ENABLED}\n"
-        f"FOOTBALL_DATA_TOKEN={'есть' if bool(FOOTBALL_DATA_TOKEN) else 'нет'}\n"
-        f"FOOTBALL_COMPETITIONS={','.join(FOOTBALL_COMPETITIONS)}\n"
-        f"FOOTBALL_BASE={FOOTBALL_BASE}\n"
-        f"DISPLAY_TZ={DISPLAY_TZ}"
-    )
-    await m.answer(f"<pre>{msg}</pre>")
 
 
 async def main():
