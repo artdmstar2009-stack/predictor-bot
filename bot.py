@@ -931,10 +931,14 @@ def _pretty_time(dt_raw: str) -> str:
     if not dt_raw:
         return "—"
     try:
-        dt = datetime.fromisoformat(dt_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
-        return f"{dt.day:02d} {RU_MON[dt.month-1]} • {dt.hour:02d}:{dt.minute:02d} UTC"
+        dt = datetime.fromisoformat(str(dt_raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(DISPLAY_ZONE)
+        return f"{dt.day:02d} {RU_MON[dt.month-1]} • {dt.hour:02d}:{dt.minute:02d} МСК"
     except Exception:
-        return dt_raw.replace("T", " ").replace("+00:00", " UTC")
+        return str(dt_raw).replace("T", " ").replace("+00:00", " МСК")
+
 
 def _pretty_title(title: str, sport: str) -> str:
     t = (title or "").strip()
@@ -1144,34 +1148,67 @@ async def http_json(session: aiohttp.ClientSession, url: str, headers: Optional[
         return await resp.json()
 
 async def football_list(session: aiohttp.ClientSession, date_from: datetime, date_to: datetime) -> List[SyncedMatch]:
-    if not FOOTBALL_ENABLED or not FOOTBALL_DATA_TOKEN:
+    """Fetch football matches from football-data.org."""
+    if not FOOTBALL_ENABLED:
+        logger.info("football_list: FOOTBALL_ENABLED=0")
         return []
+
+    if not FOOTBALL_DATA_TOKEN:
+        logger.warning("football_list: FOOTBALL_DATA_TOKEN is empty")
+        return []
+
     headers = {"X-Auth-Token": FOOTBALL_DATA_TOKEN}
     df = date_from.date().isoformat()
     dt = date_to.date().isoformat()
     out: List[SyncedMatch] = []
+
     for comp in FOOTBALL_COMPETITIONS:
+        comp = comp.strip()
+        if not comp:
+            continue
+
         url = f"{FOOTBALL_BASE}/competitions/{comp}/matches?dateFrom={df}&dateTo={dt}"
+
         try:
             data = await http_json(session, url, headers=headers)
         except Exception as e:
-            logger.warning("football list failed comp=%s err=%s", comp, e)
+            logger.warning("football list failed comp=%s url=%s err=%s", comp, url, e)
             continue
-        for m in (data.get("matches") or []):
+
+        matches = data.get("matches") or []
+        logger.info("football_list: comp=%s matches=%s", comp, len(matches))
+
+        for m in matches:
             mid = str(m.get("id") or "")
             utc = m.get("utcDate") or ""
             if not mid or not utc:
                 continue
+
             try:
                 start = datetime.fromisoformat(utc.replace("Z", "+00:00")).astimezone(timezone.utc)
             except Exception:
+                logger.warning("football_list: bad utcDate=%s", utc)
                 continue
-            home = ((m.get("homeTeam") or {}).get("name") or "").strip()
-            away = ((m.get("awayTeam") or {}).get("name") or "").strip()
+
+            if start <= now_utc():
+                continue
+
+            home_obj = m.get("homeTeam") or {}
+            away_obj = m.get("awayTeam") or {}
+
+            home = (home_obj.get("shortName") or home_obj.get("tla") or home_obj.get("name") or "").strip()
+            away = (away_obj.get("shortName") or away_obj.get("tla") or away_obj.get("name") or "").strip()
+
+            if not home or not away:
+                continue
+
             league = ((m.get("competition") or {}).get("name") or comp).strip()
-            title = f"{home} vs {away}".strip()
+            title = f"{home} vs {away}"
+
             out.append(SyncedMatch("football", mid, "football", league, title, start))
+
     return out
+
 
 async def football_result(session: aiohttp.ClientSession, external_id: str) -> Optional[FinishedInfo]:
     if not FOOTBALL_DATA_TOKEN:
@@ -1294,8 +1331,8 @@ def upsert_matches(matches: List[SyncedMatch]) -> Tuple[int, int]:
     return inserted, updated
 
 async def autosync_once() -> str:
-    start = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=max(0, SYNC_LOOKAHEAD_DAYS))
+    start = now_utc()
+    end = start + timedelta(days=max(1, SYNC_LOOKAHEAD_DAYS))
     report: List[str] = []
     async with aiohttp.ClientSession() as session:
         allm: List[SyncedMatch] = []
@@ -2499,6 +2536,21 @@ async def ai_odds_refresh_cmd(m: Message):
     except Exception as e:
         logger.exception("ai_odds_refresh error")
         await m.answer(f"❌ Ошибка: {e}")
+
+
+@dp.message(Command("football_debug"))
+async def football_debug_cmd(m: Message):
+    if ADMIN_ID and int(m.from_user.id) != int(ADMIN_ID):
+        return await m.answer("Недостаточно прав.")
+
+    msg = (
+        f"FOOTBALL_ENABLED={FOOTBALL_ENABLED}\n"
+        f"FOOTBALL_DATA_TOKEN={'есть' if bool(FOOTBALL_DATA_TOKEN) else 'нет'}\n"
+        f"FOOTBALL_COMPETITIONS={','.join(FOOTBALL_COMPETITIONS)}\n"
+        f"FOOTBALL_BASE={FOOTBALL_BASE}\n"
+        f"DISPLAY_TZ={DISPLAY_TZ}"
+    )
+    await m.answer(f"<pre>{msg}</pre>")
 
 
 async def main():
