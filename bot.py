@@ -1829,7 +1829,11 @@ async def cb_pick(cb: CallbackQuery):
 
     if BETTING_ENABLED:
         set_pref(cb.from_user.id, pending_match_id=match_id, pending_pick=pick, awaiting_stake=True)
-        odds = match_odds_for_pick(match, pick) or 2.00
+        odds = match_odds_for_pick(match, pick)
+        if odds is None:
+            if pick == "X":
+                return await cb.answer("На этот матч ничья недоступна. Выбери 1 или 2.", show_alert=True)
+            return await cb.answer("Коэффициент для исхода недоступен.", show_alert=True)
         kb = stake_keyboard(match_id, pick, float(odds))
         await cb.message.answer(
             f"💰 Выбери сумму ставки\n"
@@ -1930,6 +1934,20 @@ async def place_bet(user_id: int, match_id: int, pick: str, stake: int, event):
             return await event.answer(why, show_alert=True)
         return await event.answer(why)
 
+    odds = match_odds_for_pick(match, pick)
+
+    # If draw is unavailable (e.g. NHL), explain instead of silently failing.
+    if odds is None:
+        if pick == "X":
+            msg = "На этот матч ничья недоступна. Выбери победу 1 или 2."
+        else:
+            msg = "Коэффициент для этого исхода недоступен."
+        if isinstance(event, CallbackQuery):
+            return await event.answer(msg, show_alert=True)
+        return await event.answer(msg)
+
+    odds = float(odds)
+
     bal = get_balance(user_id)
     if bal < stake:
         msg = f"Недостаточно баланса. Баланс: {bal}"
@@ -1937,7 +1955,6 @@ async def place_bet(user_id: int, match_id: int, pick: str, stake: int, event):
             return await event.answer(msg, show_alert=True)
         return await event.answer(msg)
 
-    odds = match_odds_for_pick(match, pick)
     add_balance(user_id, -stake)
 
     with db() as con:
@@ -1958,9 +1975,10 @@ async def place_bet(user_id: int, match_id: int, pick: str, stake: int, event):
     )
     if isinstance(event, CallbackQuery):
         await event.message.answer(text)
-        await event.answer()
+        await event.answer("✅ Ставка принята")
     else:
         await event.answer(text)
+
 
 @dp.message(F.text == BTN_FIND_MATCH)
 async def find_match(m: Message):
