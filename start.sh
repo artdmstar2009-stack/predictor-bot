@@ -1,3 +1,3 @@
 #!/bin/bash
 set -e
-python runner.py
+python bot.py
