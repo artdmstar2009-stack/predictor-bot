@@ -1,2 +1,4 @@
 #!/bin/bash
-python bot.py
+set -e
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}."
+python -c "import sitecustomize, runpy; runpy.run_path('bot.py', run_name='__main__')"
