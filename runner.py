@@ -176,6 +176,13 @@ print("RUNNER_THESPORTSDB_FOOTBALL_PROVIDER", "SYNC_LOOKAHEAD_DAYS=", bot.SYNC_L
 
 def apply_theme() -> None:
     try:
+        import ai_line  # noqa: E402
+
+        ai_line.apply(bot)
+    except Exception as exc:
+        logger.exception("AI line apply failed: %s", exc)
+
+    try:
         import theme  # noqa: E402
 
         theme.apply(bot)
