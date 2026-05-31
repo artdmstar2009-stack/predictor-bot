@@ -2,16 +2,33 @@ from __future__ import annotations
 
 """Compatibility launcher.
 
-Render was still starting `python bot.py`, so keep that command working while
-running the patched football provider from runner.py. The original bot module
-lives in bot_core.py.
+Render may start `python bot.py`, while runner.py contains the patched football
+provider. The original bot module lives in bot_core.py.
 """
 
+import asyncio
 import importlib
-import runpy
 import sys
 
 bot_core = importlib.import_module("bot_core")
 sys.modules["bot"] = bot_core
 
-runpy.run_module("runner", run_name="__main__")
+
+def main() -> None:
+    runner = importlib.import_module("runner")
+    apply_theme = getattr(runner, "apply_theme", None)
+    if callable(apply_theme):
+        apply_theme()
+    else:
+        try:
+            theme = importlib.import_module("theme")
+            theme.apply(bot_core)
+            print("RUNNER_THEME_APPLIED")
+        except Exception as exc:
+            bot_core.logger.exception("theme apply failed: %s", exc)
+
+    asyncio.run(bot_core.main())
+
+
+if __name__ == "__main__":
+    main()
