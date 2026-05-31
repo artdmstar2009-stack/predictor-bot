@@ -220,4 +220,42 @@ def _install_thesportsdb_fallback() -> None:
     aiohttp.ClientSession.get = patched_get
 
 
+def _install_theme_autorun() -> None:
+    try:
+        import asyncio
+        import sys
+    except Exception:
+        return
+
+    original_run = asyncio.run
+    if getattr(original_run, "_predictor_theme_wrapped", False):
+        return
+
+    def themed_run(main, *args, **kwargs):
+        try:
+            frame = getattr(main, "cr_frame", None)
+            globs = getattr(frame, "f_globals", {}) if frame else {}
+            module_name = globs.get("__name__")
+            module = sys.modules.get(module_name)
+            looks_like_predictor_bot = all(
+                key in globs
+                for key in ("dp", "bot", "show_match_card", "InlineKeyboardButton", "ReplyKeyboardMarkup")
+            )
+            if module is not None and looks_like_predictor_bot and not getattr(module, "_PRETTY_THEME_APPLIED", False):
+                import theme
+
+                theme.apply(module)
+                print("SITECUSTOMIZE_THEME_APPLIED")
+        except Exception as exc:
+            try:
+                print(f"SITECUSTOMIZE_THEME_FAILED {exc}")
+            except Exception:
+                pass
+        return original_run(main, *args, **kwargs)
+
+    themed_run._predictor_theme_wrapped = True
+    asyncio.run = themed_run
+
+
 _install_thesportsdb_fallback()
+_install_theme_autorun()
