@@ -17,6 +17,9 @@ def _bar(value: int, total: int, width: int = 8) -> str:
 
 
 def apply(bot) -> None:
+    if getattr(bot, "_PRETTY_THEME_APPLIED", False):
+        return
+
     InlineKeyboardButton = bot.InlineKeyboardButton
     InlineKeyboardMarkup = bot.InlineKeyboardMarkup
     KeyboardButton = bot.KeyboardButton
@@ -31,7 +34,11 @@ def apply(bot) -> None:
             [KeyboardButton(text=bot.BTN_LB), KeyboardButton(text=bot.BTN_PROFILE)],
             [KeyboardButton(text=bot.BTN_HELP)],
         ]
-        return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, input_field_placeholder="Выбери раздел")
+        return ReplyKeyboardMarkup(
+            keyboard=rows,
+            resize_keyboard=True,
+            input_field_placeholder="Выбери раздел",
+        )
 
     def ikb_sports(sports):
         rows = []
@@ -76,6 +83,26 @@ def apply(bot) -> None:
             [InlineKeyboardButton(text="← К категориям", callback_data="back:sports")],
         ])
 
+    def _odds_line(match) -> str:
+        odds_match = None
+        try:
+            odds_match = bot.ai_odds_for_match(dict(match))
+        except Exception:
+            odds_match = None
+        if not odds_match:
+            return ""
+
+        parts = []
+        if odds_match.get("odds_1"):
+            parts.append(f"1 <b>{float(odds_match['odds_1']):.2f}</b>")
+        if odds_match.get("odds_x"):
+            parts.append(f"X <b>{float(odds_match['odds_x']):.2f}</b>")
+        if odds_match.get("odds_2"):
+            parts.append(f"2 <b>{float(odds_match['odds_2']):.2f}</b>")
+        if not parts:
+            return ""
+        return "\n🎯 " + "   ".join(parts)
+
     async def show_match_card(target, match_id: int) -> None:
         match = bot.get_match(match_id)
         if not match:
@@ -104,28 +131,12 @@ def apply(bot) -> None:
             pct = 0 if total_votes <= 0 else round((count / total_votes) * 100)
             return f"{label}  <code>{_bar(count, total_votes)}</code>  <b>{pct}%</b> · {count}"
 
-        odds = bot.ai_odds_for_match(dict(match)) if "ai_odds_for_match" in bot.globals() if False else None
-        odds_line = ""
-        try:
-            odds_match = bot.ai_odds_for_match(dict(match))
-            parts = []
-            if odds_match.get("odds_1"):
-                parts.append(f"1 <b>{float(odds_match['odds_1']):.2f}</b>")
-            if odds_match.get("odds_x"):
-                parts.append(f"X <b>{float(odds_match['odds_x']):.2f}</b>")
-            if odds_match.get("odds_2"):
-                parts.append(f"2 <b>{float(odds_match['odds_2']):.2f}</b>")
-            if parts:
-                odds_line = "\n🎯 " + "   ".join(parts)
-        except Exception:
-            odds_line = ""
-
         text = (
             f"<b>{_safe(title)}</b>\n"
             f"🏆 {league}\n"
             f"🕒 <b>{_safe(start)}</b>\n"
             f"⏳ дедлайн: <i>{_safe(deadline)}</i>\n"
-            f"{status}{odds_line}\n\n"
+            f"{status}{_odds_line(match)}\n\n"
             f"<b>Прогнозы</b> · всего {total_votes}\n"
             f"{line('🏠 1', '1')}\n"
             f"{line('🤝 X', 'X')}\n"
@@ -147,3 +158,4 @@ def apply(bot) -> None:
     bot.ikb_matches_list = ikb_matches_list
     bot.ikb_match_card = ikb_match_card
     bot.show_match_card = show_match_card
+    bot._PRETTY_THEME_APPLIED = True
