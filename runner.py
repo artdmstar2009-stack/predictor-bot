@@ -173,5 +173,17 @@ bot.SYNC_LOOKAHEAD_DAYS = max(int(getattr(bot, "SYNC_LOOKAHEAD_DAYS", 1) or 1), 
 
 print("RUNNER_THESPORTSDB_FOOTBALL_PROVIDER", "SYNC_LOOKAHEAD_DAYS=", bot.SYNC_LOOKAHEAD_DAYS)
 
+
+def apply_theme() -> None:
+    try:
+        import theme  # noqa: E402
+
+        theme.apply(bot)
+        print("RUNNER_THEME_APPLIED")
+    except Exception as exc:
+        logger.exception("theme apply failed: %s", exc)
+
+
 if __name__ == "__main__":
+    apply_theme()
     asyncio.run(bot.main())
