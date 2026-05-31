@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from html import escape
 from typing import Any
 
@@ -24,6 +25,9 @@ def _short(text: str, limit: int) -> str:
 
 
 def apply(bot) -> None:
+    os.environ.setdefault("AI_LINE_HOME_ADV_FOOTBALL", "0")
+    os.environ.setdefault("AI_LINE_MARGIN", "0.06")
+
     try:
         import ai_line
 
