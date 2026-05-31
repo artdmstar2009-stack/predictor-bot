@@ -21,6 +21,11 @@ def main() -> None:
         apply_theme()
     else:
         try:
+            ai_line = importlib.import_module("ai_line")
+            ai_line.apply(bot_core)
+        except Exception as exc:
+            bot_core.logger.exception("AI line apply failed: %s", exc)
+        try:
             theme = importlib.import_module("theme")
             theme.apply(bot_core)
             print("RUNNER_THEME_APPLIED")
