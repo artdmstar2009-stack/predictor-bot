@@ -24,6 +24,15 @@ def _short(text: str, limit: int) -> str:
 
 
 def apply(bot) -> None:
+    try:
+        import ai_line
+
+        ai_line.apply(bot)
+    except Exception as exc:
+        logger = getattr(bot, "logger", None)
+        if logger:
+            logger.exception("AI line apply failed from theme: %s", exc)
+
     if getattr(bot, "_PRETTY_THEME_APPLIED", False):
         return
 
