@@ -24,6 +24,10 @@ logger = logging.getLogger("predictor_bot")
 THESPORTSDB_API_KEY = (os.getenv("THESPORTSDB_API_KEY") or os.getenv("THESPORTSDB_KEY") or "123").strip()
 THESPORTSDB_BASE = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}".rstrip("/")
 THESPORTSDB_ENABLED = os.getenv("THESPORTSDB_ENABLED", "1") == "1"
+THESPORTSDB_DAY_SEARCH = os.getenv(
+    "THESPORTSDB_DAY_SEARCH",
+    "0" if THESPORTSDB_API_KEY == "123" else "1",
+) == "1"
 
 THESPORTSDB_LEAGUES = {
     "PL": ("4328", "English Premier League"),
@@ -80,6 +84,16 @@ async def _tsdb_json(session, url: str) -> dict:
         return await bot.http_json(session, url)
 
 
+def _add_event(out: list, seen: set, comp: str, league_name: str, event: dict, window_start: datetime, window_end: datetime) -> None:
+    event_id = str(event.get("idEvent") or "")
+    if not event_id or event_id in seen:
+        return
+    match = _event_to_match(comp, league_name, event, window_start, window_end)
+    if match:
+        seen.add(event_id)
+        out.append(match)
+
+
 async def _tsdb_events_for_comp(session, comp: str, date_from: datetime, date_to: datetime):
     if not THESPORTSDB_ENABLED:
         return []
@@ -96,39 +110,30 @@ async def _tsdb_events_for_comp(session, comp: str, date_from: datetime, date_to
     out = []
     seen = set()
 
-    day = window_start.date()
-    while day <= window_end.date():
-        url = f"{THESPORTSDB_BASE}/eventsday.php?d={day.isoformat()}&s=Soccer&l={league_id}"
-        try:
-            data = await _tsdb_json(session, url)
-        except Exception as exc:
-            logger.warning("thesportsdb eventsday failed comp=%s day=%s err=%s", comp, day.isoformat(), exc)
-            day += timedelta(days=1)
-            continue
-        for event in data.get("events") or []:
-            event_id = str(event.get("idEvent") or "")
-            if event_id in seen:
-                continue
-            match = _event_to_match(comp, league_name, event, window_start, window_end)
-            if match:
-                seen.add(event_id)
-                out.append(match)
-        day += timedelta(days=1)
-
-    # The public endpoint often has a compact "next event" list even when day search is sparse.
+    # Keep public key usage low: one compact request per league first.
     url = f"{THESPORTSDB_BASE}/eventsnextleague.php?id={league_id}"
     try:
         data = await _tsdb_json(session, url)
         for event in data.get("events") or []:
-            event_id = str(event.get("idEvent") or "")
-            if event_id in seen:
-                continue
-            match = _event_to_match(comp, league_name, event, window_start, window_end)
-            if match:
-                seen.add(event_id)
-                out.append(match)
+            _add_event(out, seen, comp, league_name, event, window_start, window_end)
     except Exception as exc:
         logger.warning("thesportsdb eventsnextleague failed comp=%s err=%s", comp, exc)
+
+    if THESPORTSDB_DAY_SEARCH:
+        day = window_start.date()
+        while day <= window_end.date():
+            url = f"{THESPORTSDB_BASE}/eventsday.php?d={day.isoformat()}&s=Soccer&l={league_id}"
+            try:
+                data = await _tsdb_json(session, url)
+            except Exception as exc:
+                logger.warning("thesportsdb eventsday failed comp=%s day=%s err=%s", comp, day.isoformat(), exc)
+                day += timedelta(days=1)
+                continue
+            for event in data.get("events") or []:
+                _add_event(out, seen, comp, league_name, event, window_start, window_end)
+            day += timedelta(days=1)
+    else:
+        logger.info("thesportsdb eventsday skipped comp=%s key=public day_search=0", comp)
 
     out.sort(key=lambda item: item.start_time_utc)
     logger.info("thesportsdb football_list: comp=%s matches=%s", comp, len(out))
