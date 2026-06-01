@@ -176,6 +176,13 @@ print("RUNNER_THESPORTSDB_FOOTBALL_PROVIDER", "SYNC_LOOKAHEAD_DAYS=", bot.SYNC_L
 
 def apply_theme() -> None:
     try:
+        import polling_guard  # noqa: E402
+
+        polling_guard.apply(bot)
+    except Exception as exc:
+        logger.exception("polling guard apply failed: %s", exc)
+
+    try:
         import ai_line  # noqa: E402
 
         ai_line.apply(bot)
