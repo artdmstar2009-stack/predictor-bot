@@ -29,7 +29,7 @@ THESPORTSDB_ENABLED = os.getenv("THESPORTSDB_ENABLED", "1") == "1"
 # eventsnextleague request per league is enough for the Mini App list.
 THESPORTSDB_DAY_SEARCH = False if THESPORTSDB_PUBLIC_KEY else os.getenv("THESPORTSDB_DAY_SEARCH", "1") == "1"
 if THESPORTSDB_PUBLIC_KEY and os.getenv("THESPORTSDB_DAY_SEARCH") == "1":
-    logger.warning("THESPORTSDB_DAY_SEARCH=1 ignored for public key 123 to avoid HTTP 429")
+    logger.info("TheSportsDB public key detected: day search disabled automatically to avoid HTTP 429")
 
 THESPORTSDB_LEAGUES = {
     "PL": ("4328", "English Premier League"),
