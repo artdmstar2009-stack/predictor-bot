@@ -38,11 +38,13 @@ def apply(bot) -> None:
     os.environ.setdefault("AI_LINE_HOME_ADV_FOOTBALL", "0")
     os.environ.setdefault("AI_LINE_MARGIN", "0.06")
 
+    _apply_optional(bot, "polling_guard")
     _apply_optional(bot, "ai_line")
     _apply_optional(bot, "line_backtest")
 
     if getattr(bot, "_PRETTY_THEME_APPLIED", False):
         _apply_optional(bot, "mini_app")
+        _apply_optional(bot, "mini_app_patch")
         return
 
     InlineKeyboardButton = bot.InlineKeyboardButton
@@ -184,3 +186,4 @@ def apply(bot) -> None:
     bot._PRETTY_THEME_APPLIED = True
 
     _apply_optional(bot, "mini_app")
+    _apply_optional(bot, "mini_app_patch")
