@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-VERSION = "AI_LINE_BACKTEST_V1"
+VERSION = "AI_LINE_BACKTEST_V2"
 
 
 def _prob_map(priced: dict[str, Any]) -> dict[str, float]:
@@ -181,29 +181,29 @@ def run_backtest(bot, limit: int = 500) -> dict[str, Any]:
 
 def format_backtest(result: dict[str, Any]) -> str:
     if result.get("matches", 0) <= 0:
-        return "<b>Backtest AI-линии</b>\nНет закрытых матчей с результатами."
+        return "<b>Backtest AI-line</b>\nNo closed matches with results yet."
 
     roi = result.get("virtual_roi")
-    roi_text = "—" if roi is None else f"{roi:+.1%}"
+    roi_text = "-" if roi is None else f"{roi:+.1%}"
     lines = [
-        "<b>Backtest AI-линии</b>",
-        f"Матчей: <b>{result['matches']}</b>",
-        f"Точность top-pick: <b>{result['accuracy']:.1%}</b>",
-        f"Средняя уверенность: <b>{result['avg_confidence']:.1%}</b>",
+        "<b>Backtest AI-line</b>",
+        f"Matches: <b>{result['matches']}</b>",
+        f"Top-pick accuracy: <b>{result['accuracy']:.1%}</b>",
+        f"Average confidence: <b>{result['avg_confidence']:.1%}</b>",
         f"Brier: <b>{result['brier']:.3f}</b> · LogLoss: <b>{result['log_loss']:.3f}</b>",
-        f"Virtual ROI по собственной линии: <b>{roi_text}</b>",
+        f"Virtual ROI by internal line: <b>{roi_text}</b>",
     ]
 
     if result.get("by_sport"):
-        lines.append("\n<b>По видам спорта</b>")
+        lines.append("\n<b>By sport</b>")
         for sport, stat in sorted(result["by_sport"].items()):
-            lines.append(f"{sport}: {stat['accuracy']:.1%} · {stat['matches']} матчей")
+            lines.append(f"{sport}: {stat['accuracy']:.1%} · {stat['matches']} matches")
 
     if result.get("calibration"):
-        lines.append("\n<b>Калибровка</b>")
+        lines.append("\n<b>Calibration</b>")
         for stat in result["calibration"][:8]:
             lines.append(
-                f"{stat['bucket']}: факт {stat['accuracy']:.1%}, ожид. {stat['avg_confidence']:.1%}, n={stat['matches']}"
+                f"{stat['bucket']}: actual {stat['accuracy']:.1%}, expected {stat['avg_confidence']:.1%}, n={stat['matches']}"
             )
 
     return "\n".join(lines)
@@ -231,11 +231,26 @@ def _register_command(bot) -> None:
     bot._AI_LINE_BACKTEST_REGISTERED = True
 
 
+def _apply_mini_betting(bot) -> None:
+    if getattr(bot, "_MINI_APP_BETTING_APPLIED", False):
+        return
+    try:
+        import mini_betting_patch
+
+        mini_betting_patch.apply(bot)
+    except Exception as exc:
+        logger = getattr(bot, "logger", None)
+        if logger:
+            logger.exception("mini betting apply failed from line_backtest: %s", exc)
+
+
 def apply(bot) -> None:
     if getattr(bot, "_AI_LINE_BACKTEST_APPLIED", False):
+        _apply_mini_betting(bot)
         return
     bot.run_ai_line_backtest = lambda limit=500: run_backtest(bot, limit)
     bot.format_ai_line_backtest = format_backtest
     _register_command(bot)
     bot._AI_LINE_BACKTEST_APPLIED = True
+    _apply_mini_betting(bot)
     print(f"{VERSION}_APPLIED")
