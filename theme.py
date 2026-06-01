@@ -45,6 +45,7 @@ def apply(bot) -> None:
     if getattr(bot, "_PRETTY_THEME_APPLIED", False):
         _apply_optional(bot, "mini_app")
         _apply_optional(bot, "mini_app_patch")
+        _apply_optional(bot, "tennis_patch")
         return
 
     InlineKeyboardButton = bot.InlineKeyboardButton
@@ -187,3 +188,4 @@ def apply(bot) -> None:
 
     _apply_optional(bot, "mini_app")
     _apply_optional(bot, "mini_app_patch")
+    _apply_optional(bot, "tennis_patch")
