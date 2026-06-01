@@ -4,7 +4,7 @@ import asyncio
 import os
 from typing import Any
 
-VERSION = "POLLING_GUARD_V2"
+VERSION = "POLLING_GUARD_V3"
 FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 
 
@@ -20,6 +20,66 @@ async def _sleep_forever(bot_module: Any, reason: str) -> None:
         await asyncio.sleep(3600)
 
 
+def _conflict_settings() -> tuple[int, int]:
+    sleep_s = max(30, int(os.getenv("POLLING_CONFLICT_SLEEP", "300") or "300"))
+    max_conflicts = max(1, int(os.getenv("POLLING_CONFLICT_MAX", "1") or "1"))
+    return sleep_s, max_conflicts
+
+
+def _is_get_updates_method(method: Any) -> bool:
+    try:
+        from aiogram.methods import GetUpdates
+
+        return isinstance(method, GetUpdates)
+    except Exception:
+        return method.__class__.__name__ == "GetUpdates"
+
+
+def _patch_bot_call(bot_module: Any) -> None:
+    tg_bot = getattr(bot_module, "bot", None)
+    if tg_bot is None:
+        return
+
+    bot_cls = tg_bot.__class__
+    original_call = getattr(bot_cls, "__call__", None)
+    if not callable(original_call) or getattr(original_call, "_polling_guard_wrapped", False):
+        return
+
+    try:
+        from aiogram.exceptions import TelegramConflictError
+    except Exception:  # pragma: no cover - aiogram is present in production
+        TelegramConflictError = RuntimeError
+
+    async def guarded_call(self, method, *args, **kwargs):
+        try:
+            return await original_call(self, method, *args, **kwargs)
+        except TelegramConflictError:
+            if not _is_get_updates_method(method):
+                raise
+
+            conflict_count = int(getattr(self, "_polling_guard_conflicts", 0) or 0) + 1
+            setattr(self, "_polling_guard_conflicts", conflict_count)
+            sleep_s, max_conflicts = _conflict_settings()
+            logger = getattr(bot_module, "logger", None)
+            if logger:
+                logger.error(
+                    "polling guard: Telegram getUpdates conflict (%s/%s). Another process uses this BOT_TOKEN.",
+                    conflict_count,
+                    max_conflicts,
+                )
+            if conflict_count >= max_conflicts:
+                await _sleep_forever(
+                    bot_module,
+                    "Telegram conflict detected; this process keeps web/Mini App alive and stops polling",
+                )
+            await asyncio.sleep(sleep_s)
+            return []
+
+    guarded_call._polling_guard_wrapped = True
+    guarded_call._polling_guard_original = original_call
+    bot_cls.__call__ = guarded_call
+
+
 def _patch_get_updates(bot_module: Any) -> None:
     tg_bot = getattr(bot_module, "bot", None)
     original_get_updates = getattr(tg_bot, "get_updates", None)
@@ -31,18 +91,16 @@ def _patch_get_updates(bot_module: Any) -> None:
     except Exception:  # pragma: no cover - aiogram is present in production
         TelegramConflictError = RuntimeError
 
-    conflict_count = 0
     setattr(tg_bot, "_polling_guard_original_get_updates", original_get_updates)
 
     async def guarded_get_updates(*args, **kwargs):
-        nonlocal conflict_count
         try:
             return await original_get_updates(*args, **kwargs)
         except TelegramConflictError:
-            conflict_count += 1
+            conflict_count = int(getattr(tg_bot, "_polling_guard_conflicts", 0) or 0) + 1
+            setattr(tg_bot, "_polling_guard_conflicts", conflict_count)
+            sleep_s, max_conflicts = _conflict_settings()
             logger = getattr(bot_module, "logger", None)
-            sleep_s = max(30, int(os.getenv("POLLING_CONFLICT_SLEEP", "300") or "300"))
-            max_conflicts = max(1, int(os.getenv("POLLING_CONFLICT_MAX", "2") or "2"))
             if logger:
                 logger.error(
                     "polling guard: Telegram getUpdates conflict (%s/%s). Another instance uses this BOT_TOKEN.",
@@ -99,6 +157,7 @@ def apply(bot_module: Any) -> None:
     if dp is None or not callable(original_start_polling):
         return
 
+    _patch_bot_call(bot_module)
     _patch_get_updates(bot_module)
 
     async def guarded_start_polling(*args, **kwargs):
