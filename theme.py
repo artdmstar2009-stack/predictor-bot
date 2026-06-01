@@ -24,20 +24,25 @@ def _short(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+def _apply_optional(bot, module_name: str) -> None:
+    try:
+        module = __import__(module_name)
+        module.apply(bot)
+    except Exception as exc:
+        logger = getattr(bot, "logger", None)
+        if logger:
+            logger.exception("%s apply failed from theme: %s", module_name, exc)
+
+
 def apply(bot) -> None:
     os.environ.setdefault("AI_LINE_HOME_ADV_FOOTBALL", "0")
     os.environ.setdefault("AI_LINE_MARGIN", "0.06")
 
-    try:
-        import ai_line
-
-        ai_line.apply(bot)
-    except Exception as exc:
-        logger = getattr(bot, "logger", None)
-        if logger:
-            logger.exception("AI line apply failed from theme: %s", exc)
+    _apply_optional(bot, "ai_line")
+    _apply_optional(bot, "line_backtest")
 
     if getattr(bot, "_PRETTY_THEME_APPLIED", False):
+        _apply_optional(bot, "mini_app")
         return
 
     InlineKeyboardButton = bot.InlineKeyboardButton
@@ -177,3 +182,5 @@ def apply(bot) -> None:
     bot.ikb_match_card = ikb_match_card
     bot.show_match_card = show_match_card
     bot._PRETTY_THEME_APPLIED = True
+
+    _apply_optional(bot, "mini_app")
