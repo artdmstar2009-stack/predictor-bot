@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from html import escape
 from typing import Any
 
 VERSION = "MINI_APP_V1"
@@ -20,24 +19,39 @@ def _public_base_url() -> str:
     ).strip()
     if raw.endswith("/health"):
         raw = raw[:-7]
+    if raw.endswith("/app"):
+        raw = raw[:-4]
     return raw.rstrip("/")
 
 
 def _json_response(bot, data: Any):
     return bot.web.Response(
         text=json.dumps(data, ensure_ascii=False, default=str),
-        content_type="application/json; charset=utf-8",
+        content_type="application/json",
+        charset="utf-8",
     )
 
 
+def _text_response(bot, text: str, content_type: str):
+    return bot.web.Response(text=text, content_type=content_type, charset="utf-8")
+
+
+def _int_query(value: str | None, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value or default)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(number, maximum))
+
+
 def _row_to_match(bot, row) -> dict[str, Any]:
-    match = dict(row)
     try:
         priced = bot.ai_odds_for_match(dict(row))
     except Exception:
         priced = {}
     stats = bot.match_stats(int(row["id"])) if hasattr(bot, "match_stats") else {"1": 0, "X": 0, "2": 0}
     total_votes = int(stats.get("1", 0) + stats.get("X", 0) + stats.get("2", 0))
+    start_value = row["start_time_utc"] or row["start_time"]
     return {
         "id": int(row["id"]),
         "title": row["title"],
@@ -45,8 +59,8 @@ def _row_to_match(bot, row) -> dict[str, Any]:
         "league": row["league"] or "",
         "status": row["status"],
         "result": row["result"],
-        "start_time": row["start_time_utc"] or row["start_time"],
-        "display_time": bot._pretty_time(row["start_time_utc"] or row["start_time"] or "") if hasattr(bot, "_pretty_time") else (row["start_time_utc"] or row["start_time"]),
+        "start_time": start_value,
+        "display_time": bot._pretty_time(start_value or "") if hasattr(bot, "_pretty_time") else start_value,
         "odds": {
             "1": priced.get("odds_1") or row["odds_1"],
             "X": priced.get("odds_x") or row["odds_x"],
@@ -245,17 +259,17 @@ def apply(bot) -> None:
         WebAppInfo = None
 
     async def index(_request):
-        return bot.web.Response(text="ok", content_type="text/plain; charset=utf-8")
+        return _text_response(bot, "ok", "text/plain")
 
     async def app_page(_request):
-        return bot.web.Response(text=_index_html(), content_type="text/html; charset=utf-8")
+        return _text_response(bot, _index_html(), "text/html")
 
     async def api_summary(_request):
         return _json_response(bot, _summary(bot))
 
     async def api_matches(request):
         sport = request.query.get("sport", "all")
-        limit = int(request.query.get("limit", "80") or "80")
+        limit = _int_query(request.query.get("limit"), 80, 1, 200)
         return _json_response(bot, {"items": _active_matches(bot, sport, limit)})
 
     async def api_match(request):
@@ -266,7 +280,7 @@ def apply(bot) -> None:
         return _json_response(bot, _row_to_match(bot, row))
 
     async def api_backtest(request):
-        limit = int(request.query.get("limit", "500") or "500")
+        limit = _int_query(request.query.get("limit"), 500, 1, 2000)
         if not hasattr(bot, "run_ai_line_backtest"):
             return _json_response(bot, {"error": "backtest_unavailable"})
         return _json_response(bot, bot.run_ai_line_backtest(limit))
@@ -308,7 +322,6 @@ def apply(bot) -> None:
     @bot.dp.message(bot.Command("miniapp"))
     @bot.dp.message(bot.F.text == MINI_APP_BUTTON)
     async def mini_app_cmd(m: bot.Message):
-        base = _public_base_url()
         kb = app_keyboard()
         if kb:
             return await m.answer("<b>Mini App</b>", reply_markup=kb)
@@ -318,16 +331,16 @@ def apply(bot) -> None:
         )
 
     def main_menu():
-        WebAppButton = None
+        web_app_button = None
         base = _public_base_url()
         url = f"{base}/app" if base and WebAppInfo is not None else ""
         if url:
-            WebAppButton = bot.KeyboardButton(text=MINI_APP_BUTTON, web_app=WebAppInfo(url=url))
+            web_app_button = bot.KeyboardButton(text=MINI_APP_BUTTON, web_app=WebAppInfo(url=url))
         rows = [
             [bot.KeyboardButton(text=bot.BTN_ACTIVE), bot.KeyboardButton(text=bot.BTN_TODAY)],
             [bot.KeyboardButton(text=bot.BTN_FIND_MATCH), bot.KeyboardButton(text=bot.BTN_MY)],
             [bot.KeyboardButton(text=bot.BTN_LB), bot.KeyboardButton(text=bot.BTN_PROFILE)],
-            [WebAppButton or bot.KeyboardButton(text=MINI_APP_BUTTON), bot.KeyboardButton(text=bot.BTN_HELP)],
+            [web_app_button or bot.KeyboardButton(text=MINI_APP_BUTTON), bot.KeyboardButton(text=bot.BTN_HELP)],
         ]
         return bot.ReplyKeyboardMarkup(
             keyboard=rows,
