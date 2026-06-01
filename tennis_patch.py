@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-VERSION = "TENNIS_PATCH_V1"
+VERSION = "TENNIS_PATCH_V2"
 ESPN_TENNIS_BASE = "https://site.api.espn.com/apis/site/v2/sports/tennis"
+PLACEHOLDER_RE = re.compile(r"^(tbd|bye|qualifier|lucky loser|wild card|winner\b|winner of\b|to be determined|\?)", re.I)
 
 
 def _enabled() -> bool:
@@ -16,8 +18,8 @@ def _enabled() -> bool:
 def _tours() -> list[str]:
     raw = os.getenv("TENNIS_TOURS", "atp,wta")
     tours: list[str] = []
-    for item in raw.split(","):
-        tour = item.strip().lower()
+    for part in raw.split(","):
+        tour = part.strip().lower()
         if tour in ("atp", "wta") and tour not in tours:
             tours.append(tour)
     return tours or ["atp", "wta"]
@@ -63,39 +65,53 @@ def _round_name(competition: dict[str, Any]) -> str:
     return str(round_obj.get("displayName") or "").strip()
 
 
+def _clean_name(name: str) -> str:
+    name = re.sub(r"\s+", " ", str(name or "")).strip()
+    return name.strip(" -–—")
+
+
+def _is_placeholder_name(name: str) -> bool:
+    value = _clean_name(name)
+    if not value:
+        return True
+    low = value.casefold()
+    if low in {"tbd", "to be determined", "bye", "?"}:
+        return True
+    return bool(PLACEHOLDER_RE.search(value))
+
+
 def _competitor_name(comp: dict[str, Any]) -> str:
     athlete = comp.get("athlete") or {}
     for key in ("displayName", "fullName", "shortName", "name"):
-        value = str(athlete.get(key) or "").strip()
+        value = _clean_name(athlete.get(key) or "")
         if value:
             return value
 
     athletes = comp.get("athletes") or []
-    names = []
+    names: list[str] = []
     for item in athletes:
         athlete = item.get("athlete") if isinstance(item, dict) else None
         if not isinstance(athlete, dict):
             athlete = item if isinstance(item, dict) else {}
-        name = str(athlete.get("displayName") or athlete.get("fullName") or "").strip()
-        if name:
-            names.append(name)
+        value = _clean_name(athlete.get("displayName") or athlete.get("fullName") or "")
+        if value:
+            names.append(value)
     if names:
         return " / ".join(names[:2])
 
     team = comp.get("team") or {}
     for key in ("displayName", "name", "shortDisplayName", "abbreviation"):
-        value = str(team.get(key) or "").strip()
+        value = _clean_name(team.get(key) or "")
         if value:
             return value
 
-    return str(comp.get("displayName") or comp.get("name") or "").strip()
+    return _clean_name(comp.get("displayName") or comp.get("name") or "")
 
 
 def _ordered_competitors(competition: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
     competitors = [c for c in (competition.get("competitors") or []) if isinstance(c, dict)]
     if len(competitors) < 2:
         return None
-
     home = next((c for c in competitors if str(c.get("homeAway") or "").lower() == "home"), None)
     away = next((c for c in competitors if str(c.get("homeAway") or "").lower() == "away"), None)
     if home and away:
@@ -124,11 +140,8 @@ def _iter_competitions(data: dict[str, Any]):
 
 
 def _is_completed(competition: dict[str, Any]) -> bool:
-    status = competition.get("status") or {}
-    stype = status.get("type") or {}
-    if bool(stype.get("completed")):
-        return True
-    return str(stype.get("state") or "").lower() == "post"
+    stype = ((competition.get("status") or {}).get("type") or {})
+    return bool(stype.get("completed")) or str(stype.get("state") or "").lower() == "post"
 
 
 def _is_tennis(row_or_match: Any) -> bool:
@@ -145,7 +158,6 @@ def _competition_to_match(app: Any, event: dict[str, Any], grouping: dict[str, A
     comp_id = str(competition.get("id") or "").strip()
     if not comp_id or _is_completed(competition):
         return None
-
     start = _parse_dt(str(competition.get("date") or competition.get("startDate") or ""))
     if not start or start <= app.now_utc() or start < window_start or start > window_end:
         return None
@@ -156,7 +168,7 @@ def _competition_to_match(app: Any, event: dict[str, Any], grouping: dict[str, A
     home_c, away_c = ordered
     home = _competitor_name(home_c)
     away = _competitor_name(away_c)
-    if not home or not away:
+    if _is_placeholder_name(home) or _is_placeholder_name(away):
         return None
 
     pieces = ["Tennis", _event_name(event)]
@@ -181,7 +193,6 @@ def _competition_to_match(app: Any, event: dict[str, Any], grouping: dict[str, A
 async def tennis_list(app: Any, session, date_from: datetime, date_to: datetime):
     if not _enabled():
         return []
-
     window_start = date_from.astimezone(timezone.utc)
     window_end = max(date_to.astimezone(timezone.utc), window_start + timedelta(days=3))
     window_end = min(window_end, window_start + timedelta(days=30))
@@ -197,7 +208,6 @@ async def tennis_list(app: Any, session, date_from: datetime, date_to: datetime)
         except Exception as exc:
             app.logger.warning("tennis scoreboard failed tour=%s err=%s", tour, exc)
             continue
-
         for event, grouping, competition in _iter_competitions(data or {}):
             match = _competition_to_match(app, event, grouping, competition, window_start, window_end)
             if not match or match.external_id in seen:
@@ -222,7 +232,6 @@ async def tennis_result(app: Any, session, external_id: str):
     comp_id = str(external_id or "").replace("espn-tennis-", "", 1)
     if not comp_id or comp_id == external_id:
         return None
-
     for tour in _tours():
         url = f"{ESPN_TENNIS_BASE}/{tour}/scoreboard"
         try:
@@ -232,7 +241,6 @@ async def tennis_result(app: Any, session, external_id: str):
         except Exception as exc:
             app.logger.warning("tennis result failed tour=%s id=%s err=%s", tour, comp_id, exc)
             continue
-
         for _, _, competition in _iter_competitions(data or {}):
             if str(competition.get("id") or "") != comp_id:
                 continue
@@ -257,17 +265,15 @@ async def tennis_result(app: Any, session, external_id: str):
 
 def _patch_sport_labels(app: Any) -> None:
     try:
-        app.SPORT_PRETTY["tennis"] = "Tennis"
+        app.SPORT_PRETTY["tennis"] = "🎾 Теннис"
     except Exception:
         pass
-
     original_emoji = getattr(app, "_sport_emoji", None)
     if callable(original_emoji) and not getattr(original_emoji, "_tennis_wrapped", False):
         def sport_emoji(sport: str) -> str:
             if "tennis" in str(sport or "").lower():
-                return "Tennis"
+                return "🎾"
             return original_emoji(sport)
-
         sport_emoji._tennis_wrapped = True
         app._sport_emoji = sport_emoji
 
@@ -280,7 +286,6 @@ def _patch_ai_line(app: Any) -> None:
             if "tennis" in text or " atp" in text or " wta" in text:
                 return "tennis"
             return original_key(sport, league)
-
         sport_key_for_ai._tennis_wrapped = True
         app._sport_key_for_ai = sport_key_for_ai
 
@@ -310,20 +315,22 @@ def _patch_ai_line(app: Any) -> None:
             if not _is_tennis(match):
                 return original_odds(match)
             p1, px, p2 = tennis_probs(match)
-            o1, ox, o2 = app.probs_to_odds(p1, px, p2) if callable(getattr(app, "probs_to_odds", None)) else app.probs_to_odds(p1, px, p2)
+            o1, ox, o2 = app.probs_to_odds(p1, px, p2)
             out = dict(match)
             teams = app._parse_title_teams(str(out.get("title") or "")) if hasattr(app, "_parse_title_teams") else None
             if teams:
                 out["home_team"] = teams[0]
                 out["away_team"] = teams[1]
-            out["prob_1"] = round(p1, 4)
-            out["prob_x"] = None
-            out["prob_2"] = round(p2, 4)
-            out["odds_1"] = o1
-            out["odds_x"] = ox
-            out["odds_2"] = o2
-            out["odds_source"] = VERSION
-            out["odds_updated_at"] = app.iso(app.now_utc())
+            out.update({
+                "prob_1": round(p1, 4),
+                "prob_x": None,
+                "prob_2": round(p2, 4),
+                "odds_1": o1,
+                "odds_x": ox,
+                "odds_2": o2,
+                "odds_source": VERSION,
+                "odds_updated_at": app.iso(app.now_utc()),
+            })
             return out
 
         ai_odds_for_match._tennis_wrapped = True
@@ -338,7 +345,6 @@ def _patch_ai_line(app: Any) -> None:
             if pick == "X":
                 return priced.get("odds_x")
             return None
-
         app.match_odds_for_pick = match_odds_for_pick
 
 
@@ -347,14 +353,12 @@ def _patch_mini_app(app: Any) -> None:
         import mini_app
     except Exception:
         return
-
     original_available = getattr(mini_app, "_available_picks", None)
     if callable(original_available) and not getattr(original_available, "_tennis_wrapped", False):
         def available_picks(row, priced: dict[str, Any]) -> list[str]:
             if _is_tennis(row):
                 return ["1", "2"]
             return original_available(row, priced)
-
         available_picks._tennis_wrapped = True
         mini_app._available_picks = available_picks
 
@@ -364,10 +368,13 @@ def _patch_mini_app(app: Any) -> None:
             html = original_index()
             html = html.replace(
                 "nhl:'🏒 Хоккей', all:'Все'",
-                "nhl:'🏒 Хоккей', tennis:'Tennis', all:'Все'",
+                "nhl:'🏒 Хоккей', tennis:'🎾 Теннис', all:'Все'",
+            )
+            html = html.replace(
+                "return ['1','X','2'].map(p=>{",
+                "return (m.available_picks || ['1','X','2']).map(p=>{",
             )
             return html
-
         index_html._tennis_wrapped = True
         mini_app._index_html = index_html
 
@@ -407,7 +414,6 @@ def _patch_sync(app: Any) -> None:
                     await asyncio.sleep(max(30, int(getattr(app, "AUTO_RESULTS_INTERVAL", 300) or 300)))
                     if not getattr(app, "AUTO_RESULTS_ENABLED", True):
                         continue
-
                     cutoff = app.now_utc() - timedelta(minutes=max(0, int(getattr(app, "AUTO_RESULTS_MIN_AGE_MIN", 20) or 20)))
                     with app.db() as con:
                         candidates = con.execute(
@@ -422,14 +428,12 @@ def _patch_sync(app: Any) -> None:
                             """,
                             (app.iso(cutoff),),
                         ).fetchall()
-
                     for row in candidates:
                         match_id = int(row["id"])
                         source = str(row["source"] or "").lower()
                         external_id = str(row["external_id"] or "").strip()
                         if not external_id:
                             continue
-
                         fin = None
                         if source == "football":
                             try:
@@ -446,10 +450,8 @@ def _patch_sync(app: Any) -> None:
                                 fin = await tennis_result(app, session, external_id)
                             except Exception as exc:
                                 app.logger.warning("tennis_result failed: %s", exc)
-
                         if not fin:
                             continue
-
                         await app.apply_scoring_for_match(match_id, fin.result_1x2, fin.home_score, fin.away_score)
                         admin_id = int(getattr(app, "ADMIN_ID", 0) or 0)
                         if admin_id:
