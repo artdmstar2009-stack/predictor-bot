@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-VERSION = "MINI_APP_PATCH_V2"
+VERSION = "MINI_APP_PATCH_V3"
 
 
 def _patch_html(html: str) -> str:
@@ -18,6 +18,14 @@ def _patch_html(html: str) -> str:
     html = html.replace(
         "const initData = tg?.initData || '';",
         "const initData = tg?.initData || '';\nconst tgUser = tg?.initDataUnsafe?.user || null;\nconst authLabel = () => initData ? `TG OK: ${tgUser?.username ? '@' + tgUser.username : (tgUser?.first_name || 'user')}` : 'TG NO';\nfunction enforceTelegramLaunch(){ const block=document.getElementById('authBlock'); const shell=document.getElementById('appShell'); if(!initData){ if(block) block.style.display='block'; if(shell) shell.classList.add('auth-hidden'); document.body.style.background='var(--bg)'; return false; } if(block) block.style.display='none'; if(shell) shell.classList.remove('auth-hidden'); return true; }",
+    )
+    html = html.replace(
+        "nhl:'🏒 Хоккей', all:'Все'",
+        "nhl:'🏒 Хоккей', tennis:'🎾 Теннис', all:'Все'",
+    )
+    html = html.replace(
+        "return ['1','X','2'].map(p=>{",
+        "return (m.available_picks || ['1','X','2']).map(p=>{",
     )
     html = html.replace(
         "const disabled = !initData || !m.can_predict || !(m.available_picks || []).includes(p);",
