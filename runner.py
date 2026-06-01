@@ -22,12 +22,14 @@ import bot  # noqa: E402
 logger = logging.getLogger("predictor_bot")
 
 THESPORTSDB_API_KEY = (os.getenv("THESPORTSDB_API_KEY") or os.getenv("THESPORTSDB_KEY") or "123").strip()
+THESPORTSDB_PUBLIC_KEY = THESPORTSDB_API_KEY == "123"
 THESPORTSDB_BASE = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}".rstrip("/")
 THESPORTSDB_ENABLED = os.getenv("THESPORTSDB_ENABLED", "1") == "1"
-THESPORTSDB_DAY_SEARCH = os.getenv(
-    "THESPORTSDB_DAY_SEARCH",
-    "0" if THESPORTSDB_API_KEY == "123" else "1",
-) == "1"
+# The public key is heavily rate-limited. Never fan out by day with it; one
+# eventsnextleague request per league is enough for the Mini App list.
+THESPORTSDB_DAY_SEARCH = False if THESPORTSDB_PUBLIC_KEY else os.getenv("THESPORTSDB_DAY_SEARCH", "1") == "1"
+if THESPORTSDB_PUBLIC_KEY and os.getenv("THESPORTSDB_DAY_SEARCH") == "1":
+    logger.warning("THESPORTSDB_DAY_SEARCH=1 ignored for public key 123 to avoid HTTP 429")
 
 THESPORTSDB_LEAGUES = {
     "PL": ("4328", "English Premier League"),
@@ -36,6 +38,8 @@ THESPORTSDB_LEAGUES = {
     "SA": ("4332", "Italian Serie A"),
     "BL1": ("4331", "German Bundesliga"),
     "FL1": ("4334", "French Ligue 1"),
+    "WC": ("4429", "FIFA World Cup"),
+    "WORLD_CUP": ("4429", "FIFA World Cup"),
 }
 
 
@@ -133,7 +137,7 @@ async def _tsdb_events_for_comp(session, comp: str, date_from: datetime, date_to
                 _add_event(out, seen, comp, league_name, event, window_start, window_end)
             day += timedelta(days=1)
     else:
-        logger.info("thesportsdb eventsday skipped comp=%s key=public day_search=0", comp)
+        logger.info("thesportsdb eventsday skipped comp=%s key=%s day_search=0", comp, "public" if THESPORTSDB_PUBLIC_KEY else "private")
 
     out.sort(key=lambda item: item.start_time_utc)
     logger.info("thesportsdb football_list: comp=%s matches=%s", comp, len(out))
@@ -171,11 +175,26 @@ async def football_result(session, external_id: str):
     return bot.FinishedInfo("X", home, away)
 
 
+def _ensure_world_cup_competition() -> None:
+    comps = [str(c).strip() for c in getattr(bot, "FOOTBALL_COMPETITIONS", []) if str(c).strip()]
+    upper = {c.upper() for c in comps}
+    if "WC" not in upper and "WORLD_CUP" not in upper:
+        comps.append("WC")
+    bot.FOOTBALL_COMPETITIONS = comps
+
+
+_ensure_world_cup_competition()
 bot.football_list = football_list
 bot.football_result = football_result
 bot.FOOTBALL_ENABLED = True
 bot.SYNC_LOOKAHEAD_DAYS = max(int(getattr(bot, "SYNC_LOOKAHEAD_DAYS", 1) or 1), 10)
 
+logger.info(
+    "runner thesportsdb config: key=%s day_search=%s comps=%s",
+    "public" if THESPORTSDB_PUBLIC_KEY else "private",
+    THESPORTSDB_DAY_SEARCH,
+    ",".join(bot.FOOTBALL_COMPETITIONS),
+)
 print("RUNNER_THESPORTSDB_FOOTBALL_PROVIDER", "SYNC_LOOKAHEAD_DAYS=", bot.SYNC_LOOKAHEAD_DAYS)
 
 
