@@ -4,7 +4,7 @@ import asyncio
 import os
 from typing import Any
 
-VERSION = "POLLING_GUARD_V1"
+VERSION = "POLLING_GUARD_V2"
 FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 
 
@@ -32,6 +32,7 @@ def _patch_get_updates(bot_module: Any) -> None:
         TelegramConflictError = RuntimeError
 
     conflict_count = 0
+    setattr(tg_bot, "_polling_guard_original_get_updates", original_get_updates)
 
     async def guarded_get_updates(*args, **kwargs):
         nonlocal conflict_count
@@ -58,6 +59,35 @@ def _patch_get_updates(bot_module: Any) -> None:
 
     guarded_get_updates._polling_guard_wrapped = True
     tg_bot.get_updates = guarded_get_updates
+
+
+async def _preflight_get_updates(bot_module: Any) -> bool:
+    if not _env_enabled("POLLING_PREFLIGHT_ENABLED", "1"):
+        return True
+
+    tg_bot = getattr(bot_module, "bot", None)
+    get_updates = getattr(tg_bot, "_polling_guard_original_get_updates", None) or getattr(tg_bot, "get_updates", None)
+    if tg_bot is None or not callable(get_updates):
+        return True
+
+    try:
+        from aiogram.exceptions import TelegramConflictError
+    except Exception:  # pragma: no cover
+        TelegramConflictError = RuntimeError
+
+    try:
+        await get_updates(limit=1, timeout=0)
+        return True
+    except TelegramConflictError:
+        logger = getattr(bot_module, "logger", None)
+        if logger:
+            logger.error("polling guard: preflight detected another active getUpdates consumer for this BOT_TOKEN")
+        return False
+    except Exception as exc:
+        logger = getattr(bot_module, "logger", None)
+        if logger:
+            logger.warning("polling guard: preflight skipped after non-conflict error: %s", exc)
+        return True
 
 
 def apply(bot_module: Any) -> None:
@@ -93,6 +123,12 @@ def apply(bot_module: Any) -> None:
             heartbeat = getattr(bot_module, "polling_lock_heartbeat", None)
             if callable(heartbeat):
                 asyncio.create_task(heartbeat())
+
+        if not await _preflight_get_updates(bot_module):
+            return await _sleep_forever(
+                bot_module,
+                "Telegram token is already being polled elsewhere; Mini App/web stays online here",
+            )
 
         logger = getattr(bot_module, "logger", None)
         if logger:
