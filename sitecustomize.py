@@ -257,5 +257,67 @@ def _install_theme_autorun() -> None:
     asyncio.run = themed_run
 
 
+def _install_mini_betting_autorun() -> None:
+    try:
+        import builtins
+        import importlib
+        import sys
+    except Exception:
+        return
+
+    def apply_betting(bot_module) -> None:
+        if bot_module is None or getattr(bot_module, "_MINI_APP_BETTING_APPLIED", False):
+            return
+        try:
+            import mini_betting_patch
+
+            mini_betting_patch.apply(bot_module)
+        except Exception as exc:
+            try:
+                print(f"SITECUSTOMIZE_BETTING_FAILED {exc}")
+            except Exception:
+                pass
+
+    def wrap_theme(theme_module) -> None:
+        apply_fn = getattr(theme_module, "apply", None)
+        if not callable(apply_fn) or getattr(apply_fn, "_mini_betting_wrapped", False):
+            return
+
+        def apply_with_betting(bot_module, *args, **kwargs):
+            result = apply_fn(bot_module, *args, **kwargs)
+            apply_betting(bot_module)
+            return result
+
+        apply_with_betting._mini_betting_wrapped = True
+        theme_module.apply = apply_with_betting
+
+    original_import = builtins.__import__
+    if not getattr(original_import, "_mini_betting_import_wrapped", False):
+        def import_with_betting(name, globals=None, locals=None, fromlist=(), level=0):
+            module = original_import(name, globals, locals, fromlist, level)
+            if name == "theme" or name.endswith(".theme"):
+                wrap_theme(sys.modules.get("theme") or module)
+            return module
+
+        import_with_betting._mini_betting_import_wrapped = True
+        builtins.__import__ = import_with_betting
+
+    original_import_module = importlib.import_module
+    if not getattr(original_import_module, "_mini_betting_import_wrapped", False):
+        def import_module_with_betting(name, package=None):
+            module = original_import_module(name, package)
+            if name == "theme" or name.endswith(".theme"):
+                wrap_theme(module)
+            return module
+
+        import_module_with_betting._mini_betting_import_wrapped = True
+        importlib.import_module = import_module_with_betting
+
+    theme_module = sys.modules.get("theme")
+    if theme_module is not None:
+        wrap_theme(theme_module)
+
+
 _install_thesportsdb_fallback()
 _install_theme_autorun()
+_install_mini_betting_autorun()
