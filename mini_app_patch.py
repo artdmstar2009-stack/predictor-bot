@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-VERSION = "MINI_APP_PATCH_V3"
+VERSION = "MINI_APP_PATCH_V4"
 
 
 def _patch_html(html: str) -> str:
@@ -12,12 +12,24 @@ def _patch_html(html: str) -> str:
         ".auth-block { display:none; width:min(560px, calc(100% - 28px)); margin:42px auto; padding:22px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }\n    .auth-block h1 { font-size:22px; margin:0 0 8px; }\n    .auth-block p { color:var(--muted); line-height:1.45; margin:8px 0; }\n    .auth-block .steps { margin:14px 0 0; padding-left:20px; color:var(--text); line-height:1.65; }\n    .auth-hidden { display:none !important; }\n    .toast { position:fixed; left:14px; right:14px; bottom:14px; padding:12px 14px; border:1px solid var(--line); border-radius:8px; background:#182332; color:var(--text); display:none; box-shadow:0 12px 32px rgba(0,0,0,.35); }",
     )
     html = html.replace(
+        ".match { display:grid; grid-template-columns: 1fr auto; gap:12px; padding:13px 14px; border-bottom:1px solid var(--line); }",
+        ".match { display:grid; grid-template-columns:1fr; gap:12px; padding:13px 14px; border-bottom:1px solid var(--line); }",
+    )
+    html = html.replace(
+        ".odds { display:grid; grid-template-columns:repeat(3, minmax(54px,1fr)); gap:6px; min-width:190px; }",
+        ".odds { display:none; }",
+    )
+    html = html.replace(
         '<body>\n  <div class="shell">',
         '<body>\n  <section class="auth-block" id="authBlock">\n    <h1>Открой Mini App в Telegram</h1>\n    <p>Эта страница открыта как обычный сайт, поэтому Telegram не передал пользователя. Прогнозы здесь не записываются.</p>\n    <ol class="steps">\n      <li>Закрой это окно.</li>\n      <li>Открой чат с ботом в Telegram.</li>\n      <li>Нажми кнопку <b>📱 Mini App</b> или отправь <b>/app</b> и нажми <b>Открыть Mini App</b>.</li>\n    </ol>\n  </section>\n  <div class="shell" id="appShell">',
     )
     html = html.replace(
         "const initData = tg?.initData || '';",
         "const initData = tg?.initData || '';\nconst tgUser = tg?.initDataUnsafe?.user || null;\nconst authLabel = () => initData ? `TG OK: ${tgUser?.username ? '@' + tgUser.username : (tgUser?.first_name || 'user')}` : 'TG NO';\nfunction enforceTelegramLaunch(){ const block=document.getElementById('authBlock'); const shell=document.getElementById('appShell'); if(!initData){ if(block) block.style.display='block'; if(shell) shell.classList.add('auth-hidden'); document.body.style.background='var(--bg)'; return false; } if(block) block.style.display='none'; if(shell) shell.classList.remove('auth-hidden'); return true; }",
+    )
+    html = html.replace(
+        "const pickLabel = p => ({'1':'П1','X':'X','2':'П2'})[p] || p;",
+        "const pickLabel = p => ({'1':'П1','X':'X','2':'П2'})[p] || p;\nconst pickSummary = (values, picks) => (picks || ['1','X','2']).map(p => `${pickLabel(p)} ${fmtPct(values?.[p])}`).join(' · ');",
     )
     html = html.replace(
         "nhl:'🏒 Хоккей', all:'Все'",
@@ -30,6 +42,10 @@ def _patch_html(html: str) -> str:
     html = html.replace(
         "const disabled = !initData || !m.can_predict || !(m.available_picks || []).includes(p);",
         "const disabled = !m.can_predict || !(m.available_picks || []).includes(p);",
+    )
+    html = html.replace(
+        "<div class=\"meta\">AI: П1 ${fmtPct(m.probabilities['1'])} · X ${fmtPct(m.probabilities.X)} · П2 ${fmtPct(m.probabilities['2'])}</div>",
+        "<div class=\"meta\">AI: ${pickSummary(m.probabilities, m.available_picks)}</div>",
     )
     html = html.replace(
         "if(!initData){ toast('Открой через Telegram'); return; }",
