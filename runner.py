@@ -245,6 +245,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("growth features apply failed: %s", exc)
 
+    try:
+        import growth_miniapp_admin  # noqa: E402
+
+        growth_miniapp_admin.apply(bot)
+        print("RUNNER_GROWTH_MINIAPP_ADMIN_APPLIED")
+    except Exception as exc:
+        logger.exception("growth mini app admin apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
