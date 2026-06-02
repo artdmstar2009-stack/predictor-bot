@@ -261,6 +261,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("mini app access patch apply failed: %s", exc)
 
+    try:
+        import market_odds  # noqa: E402
+
+        market_odds.apply(bot)
+        print("RUNNER_MARKET_ODDS_APPLIED")
+    except Exception as exc:
+        logger.exception("market odds apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
