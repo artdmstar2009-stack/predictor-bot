@@ -221,6 +221,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("theme apply failed: %s", exc)
 
+    try:
+        import pro_features  # noqa: E402
+
+        pro_features.apply(bot)
+        print("RUNNER_PRO_FEATURES_APPLIED")
+    except Exception as exc:
+        logger.exception("pro features apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
