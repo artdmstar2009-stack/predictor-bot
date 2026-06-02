@@ -98,13 +98,23 @@ def apply(bot) -> None:
         rows.append([InlineKeyboardButton(text="← Виды спорта", callback_data="back:sports")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
+    def _available_pick_keys(match) -> list[str]:
+        sport = str((match["sport"] if match else "") or "").lower()
+        if sport in {"tennis", "hockey", "nhl"}:
+            return ["1", "2"]
+        return ["1", "X", "2"]
+
+    def _pick_label(key: str) -> str:
+        return {"1": "П1", "X": "X", "2": "П2"}.get(key, key)
+
     def ikb_match_card(match_id: int):
+        match = bot.get_match(match_id)
+        pick_buttons = [
+            InlineKeyboardButton(text=_pick_label(pick), callback_data=f"pick:{match_id}:{pick}")
+            for pick in _available_pick_keys(match)
+        ]
         return InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="П1", callback_data=f"pick:{match_id}:1"),
-                InlineKeyboardButton(text="X", callback_data=f"pick:{match_id}:X"),
-                InlineKeyboardButton(text="П2", callback_data=f"pick:{match_id}:2"),
-            ],
+            pick_buttons,
             [InlineKeyboardButton(text="📊 Статистика голосов", callback_data=f"stats:{match_id}")],
             [InlineKeyboardButton(text="← К списку матчей", callback_data="back:sports")],
         ])
@@ -140,7 +150,8 @@ def apply(bot) -> None:
             return
 
         stats = bot.match_stats(match_id)
-        total_votes = stats["1"] + stats["X"] + stats["2"]
+        pick_keys = _available_pick_keys(match)
+        total_votes = sum(int(stats.get(key, 0) or 0) for key in pick_keys)
         user_id = target.from_user.id if target.from_user else 0
         my_pick = bot.get_my_pick(user_id, match_id) if user_id else None
         allowed, why = bot.can_predict(match)
@@ -151,11 +162,10 @@ def apply(bot) -> None:
         start = bot._pretty_time((match["start_time_utc"] or match["start_time"] or ""))
         deadline = bot._pretty_time(bot.iso(dl)) if dl else "—"
         status = "Открыто для прогноза" if allowed else _safe(why)
-
-        def line(label: str, key: str) -> str:
-            count = stats[key]
-            pct = 0 if total_votes <= 0 else round((count / total_votes) * 100)
-            return f"{label:<2} <code>{_bar(count, total_votes)}</code> <b>{pct}%</b> · {count}"
+        votes = "пока нет" if total_votes <= 0 else " · ".join(
+            f"{_pick_label(key)} {int(stats.get(key, 0) or 0)}"
+            for key in pick_keys
+        )
 
         text = (
             f"<b>{_safe(title)}</b>\n"
@@ -163,10 +173,7 @@ def apply(bot) -> None:
             f"🕒 Старт: <b>{_safe(start)}</b>\n"
             f"⏳ Дедлайн: <i>{_safe(deadline)}</i>\n"
             f"▫️ {status}{_odds_line(match)}\n\n"
-            f"<b>Прогнозы игроков</b> · {total_votes}\n"
-            f"{line('П1', '1')}\n"
-            f"{line('X', 'X')}\n"
-            f"{line('П2', '2')}\n\n"
+            f"<b>Голоса игроков:</b> {votes}\n"
             f"Твой выбор: <b>{_safe(my_pick or '—')}</b>"
         )
 
