@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import timedelta
 from html import escape
 from typing import Any, Callable
 
@@ -163,15 +164,9 @@ def _open_match_stats(app: Any) -> dict[str, Any]:
             1,
             24 * 30,
         )
-        start_param = app.iso(app.now_utc() - app.timedelta(hours=2)) if hasattr(app, "timedelta") else None
-    except Exception:
-        lookahead = 72
-        start_param = None
-
-    try:
         now = app.now_utc()
-        start_param = app.iso(now - __import__("datetime").timedelta(hours=2))
-        end_param = app.iso(now + __import__("datetime").timedelta(hours=lookahead))
+        start_param = app.iso(now - timedelta(hours=2))
+        end_param = app.iso(now + timedelta(hours=lookahead))
         with app.db() as con:
             rows = con.execute(
                 """
@@ -266,21 +261,30 @@ def _debug_text(app: Any) -> str:
 
 
 class _DelayedGetContext:
-    def __init__(self, request_factory: Callable[..., Any], delay: float, lock: asyncio.Lock, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        request_factory: Callable[..., Any],
+        delay: float,
+        lock: asyncio.Lock,
+        state: dict[str, float],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
         self._request_factory = request_factory
         self._delay = delay
         self._lock = lock
+        self._state = state
         self._args = args
         self._kwargs = kwargs
         self._ctx: Any = None
 
     async def __aenter__(self) -> Any:
         async with self._lock:
-            last_ts = float(getattr(self._lock, "_market_odds_last_request_ts", 0.0) or 0.0)
+            last_ts = float(self._state.get("last_request_ts", 0.0) or 0.0)
             wait_s = max(0.0, self._delay - (time.monotonic() - last_ts)) if last_ts else 0.0
             if wait_s > 0:
                 await asyncio.sleep(wait_s)
-            setattr(self._lock, "_market_odds_last_request_ts", time.monotonic())
+            self._state["last_request_ts"] = time.monotonic()
         self._ctx = self._request_factory(*self._args, **self._kwargs)
         return await self._ctx.__aenter__()
 
@@ -301,6 +305,7 @@ def _patch_request_delay(app: Any) -> Callable[[], None]:
         return lambda: None
 
     lock = asyncio.Lock()
+    state = {"last_request_ts": 0.0}
 
     class DelayedClientSession:
         _market_odds_delayed = True
@@ -316,7 +321,7 @@ def _patch_request_delay(app: Any) -> Callable[[], None]:
             return await self._session.__aexit__(exc_type, exc, tb)
 
         def get(self, *args: Any, **kwargs: Any) -> _DelayedGetContext:
-            return _DelayedGetContext(self._session.get, delay, lock, *args, **kwargs)
+            return _DelayedGetContext(self._session.get, delay, lock, state, *args, **kwargs)
 
         def __getattr__(self, name: str) -> Any:
             return getattr(self._session, name)
