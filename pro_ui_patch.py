@@ -2,12 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-VERSION = "PRO_UI_PATCH_V1"
-
-REASON_CSS = r"""
-    .reason-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:-2px; }
-    .reason-chip { display:inline-flex; align-items:center; min-height:24px; padding:4px 7px; border:1px solid rgba(255,255,255,.09); border-radius:8px; background:rgba(255,255,255,.04); color:var(--muted); font-size:11px; line-height:1.25; }
-"""
+VERSION = "PRO_UI_PATCH_V2"
 
 TARGET_ESCAPED = r'''      <div class=\"ai-strip\"><span>AI-\u043b\u0438\u043d\u0438\u044f</span><b>${beautyPickSummary(m.probabilities, picks)}</b></div>'''
 REASON_ESCAPED = r'''
@@ -17,16 +12,21 @@ TARGET_PLAIN = '''      <div class="ai-strip"><span>AI-линия</span><b>${bea
 REASON_PLAIN = '''
       <div class="reason-list">${(m.insights?.reasons || []).slice(0,3).map(r => `<span class="reason-chip">${beautyEsc(r)}</span>`).join('')}</div>'''
 
+HIDE_REASON_CSS = """
+    .reason-list { display:none !important; }
+"""
+
 
 def _patch_html(html: str) -> str:
-    if ".reason-chip" not in html:
-        html = html.replace("</style>", REASON_CSS + "\n  </style>", 1)
-    if "m.insights?.reasons" in html:
-        return html
-    if TARGET_ESCAPED in html:
-        return html.replace(TARGET_ESCAPED, TARGET_ESCAPED + REASON_ESCAPED, 1)
-    if TARGET_PLAIN in html:
-        return html.replace(TARGET_PLAIN, TARGET_PLAIN + REASON_PLAIN, 1)
+    html = html.replace(REASON_ESCAPED, "")
+    html = html.replace(REASON_PLAIN, "")
+
+    # Remove the @ symbol only when it is used as an odds prefix, e.g. @1.89.
+    html = html.replace(">@${fmtOdd", ">${fmtOdd")
+    html = html.replace(" @${fmtOdd", " ${fmtOdd")
+
+    if ".reason-list { display:none !important; }" not in html:
+        html = html.replace("</style>", HIDE_REASON_CSS + "\n  </style>", 1)
     return html
 
 
