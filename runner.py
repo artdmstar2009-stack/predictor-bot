@@ -253,6 +253,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("growth mini app admin apply failed: %s", exc)
 
+    try:
+        import miniapp_access_patch  # noqa: E402
+
+        miniapp_access_patch.apply(bot)
+        print("RUNNER_MINIAPP_ACCESS_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("mini app access patch apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
