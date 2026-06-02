@@ -269,6 +269,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("market odds apply failed: %s", exc)
 
+    try:
+        import market_odds_guard  # noqa: E402
+
+        market_odds_guard.apply(bot)
+        print("RUNNER_MARKET_ODDS_GUARD_APPLIED")
+    except Exception as exc:
+        logger.exception("market odds guard apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
