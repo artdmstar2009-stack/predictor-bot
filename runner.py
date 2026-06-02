@@ -277,6 +277,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("market odds guard apply failed: %s", exc)
 
+    try:
+        import day_cycle_patch  # noqa: E402
+
+        day_cycle_patch.apply(bot)
+        print("RUNNER_DAY_CYCLE_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("day cycle patch apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
