@@ -156,21 +156,6 @@ def _row_value(row: Any, key: str, default: Any = None) -> Any:
         return default
 
 
-def _parse_dt(value: Any) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(raw)
-    except Exception:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
 def _day_bounds(app: Any, now: datetime | None = None) -> tuple[datetime, datetime]:
     zone = getattr(app, "DISPLAY_ZONE", timezone.utc)
     current = (now or app.now_utc()).astimezone(zone)
@@ -320,7 +305,7 @@ def _archive_day_window(app: Any) -> int:
             """
             UPDATE matches
             SET status='archived'
-            WHERE status IN ('open', 'closed')
+            WHERE status='open'
               AND COALESCE(start_time_utc, start_time) < ?
             """,
             (cutoff,),
