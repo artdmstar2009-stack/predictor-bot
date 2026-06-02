@@ -229,6 +229,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("pro features apply failed: %s", exc)
 
+    try:
+        import pro_ui_patch  # noqa: E402
+
+        pro_ui_patch.apply(bot)
+        print("RUNNER_PRO_UI_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("pro ui patch apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
