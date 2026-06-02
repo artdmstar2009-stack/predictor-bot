@@ -237,6 +237,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("pro ui patch apply failed: %s", exc)
 
+    try:
+        import growth_features  # noqa: E402
+
+        growth_features.apply(bot)
+        print("RUNNER_GROWTH_FEATURES_APPLIED")
+    except Exception as exc:
+        logger.exception("growth features apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
