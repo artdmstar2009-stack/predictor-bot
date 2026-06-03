@@ -270,6 +270,14 @@ def apply_theme() -> None:
         logger.exception("market odds apply failed: %s", exc)
 
     try:
+        import bookmaker_line_patch  # noqa: E402
+
+        bookmaker_line_patch.apply(bot)
+        print("RUNNER_BOOKMAKER_LINE_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("bookmaker line patch apply failed: %s", exc)
+
+    try:
         import market_odds_guard  # noqa: E402
 
         market_odds_guard.apply(bot)
@@ -284,6 +292,14 @@ def apply_theme() -> None:
         print("RUNNER_DAY_CYCLE_PATCH_APPLIED")
     except Exception as exc:
         logger.exception("day cycle patch apply failed: %s", exc)
+
+    try:
+        import finished_cards_patch  # noqa: E402
+
+        finished_cards_patch.apply(bot)
+        print("RUNNER_FINISHED_CARDS_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("finished cards patch apply failed: %s", exc)
 
     try:
         import silent_results_patch  # noqa: E402
