@@ -285,6 +285,14 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("day cycle patch apply failed: %s", exc)
 
+    try:
+        import silent_results_patch  # noqa: E402
+
+        silent_results_patch.apply(bot)
+        print("RUNNER_SILENT_RESULTS_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("silent results patch apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
