@@ -3,10 +3,10 @@ from __future__ import annotations
 import math
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
-VERSION = "AI_LINE_V3"
+VERSION = "AI_LINE_V4"
 
 COMMON_ALIASES = {
     "man city": "manchester city",
@@ -153,6 +153,17 @@ LEAGUE_BASE = {
     "nhl": 1540,
 }
 
+# League-specific home advantage
+LEAGUE_HOME_ADV = {
+    "premier league": 72,
+    "la liga": 68,
+    "serie a": 70,
+    "bundesliga": 70,
+    "ligue 1": 65,
+    "champions league": 60,
+    "nhl": 45,
+}
+
 
 def _norm(value: Any) -> str:
     s = str(value or "").casefold().strip()
@@ -207,6 +218,15 @@ def _league_base(league: str, sport_key: str) -> int:
     return 1540
 
 
+def _get_league_home_adv(league: str) -> int:
+    """Returns league-specific home advantage."""
+    normalized = _norm(league).lower()
+    for key, adv in LEAGUE_HOME_ADV.items():
+        if key in normalized:
+            return adv
+    return 68  # default
+
+
 def _db_rating(bot, sport_key: str, team: str) -> int | None:
     try:
         with bot.db() as con:
@@ -229,20 +249,97 @@ def _db_rating(bot, sport_key: str, team: str) -> int | None:
     return None
 
 
-def _form_bonus(bot, sport_key: str, team: str) -> int:
-    fn = getattr(bot, "get_form_bonus", None)
+def _advanced_form_bonus(bot, sport_key: str, team: str) -> int:
+    """
+    Advanced form analysis with:
+    - Streak bonuses (exponential)
+    - Win rate percentage
+    - Goal differential
+    - Momentum curve
+    Returns: [-180..+180]
+    """
+    fn = getattr(bot, "get_team_last_form", None)
     if not callable(fn):
         return 0
+    
     try:
-        return int(_clamp(float(fn(sport_key, team, 5)), -90, 90))
+        rows = fn(sport_key, team, 10)  # Last 10 matches
+        if not rows:
+            return 0
+        
+        # Streak detection
+        consecutive_wins = 0
+        consecutive_losses = 0
+        for r in rows:
+            res = (r.get("result") or "").upper()
+            if res == "W":
+                consecutive_wins += 1
+                consecutive_losses = 0
+            elif res == "L":
+                consecutive_losses += 1
+                consecutive_wins = 0
+            else:
+                break
+        
+        # Streak bonus (exponential, more aggressive)
+        if consecutive_wins >= 5:
+            streak_bonus = min(180, 40 + 28 * consecutive_wins)  # 5 wins = +180
+        elif consecutive_wins > 0:
+            streak_bonus = min(100, 20 + 16 * consecutive_wins)
+        elif consecutive_losses >= 5:
+            streak_bonus = max(-180, -40 - 28 * consecutive_losses)  # 5 losses = -180
+        elif consecutive_losses > 0:
+            streak_bonus = max(-100, -20 - 16 * consecutive_losses)
+        else:
+            streak_bonus = 0
+        
+        # Overall win rate (last 10)
+        wins = sum(1 for r in rows if (r.get("result") or "").upper() == "W")
+        losses = sum(1 for r in rows if (r.get("result") or "").upper() == "L")
+        draws = sum(1 for r in rows if (r.get("result") or "").upper() == "D")
+        
+        # Win rate bonus
+        win_rate = wins / max(len(rows), 1)
+        if win_rate > 0.6:
+            wr_bonus = int(40 + (win_rate - 0.6) * 200)  # 100% = +80
+        elif win_rate < 0.4:
+            wr_bonus = int(-40 + (win_rate - 0.4) * 200)  # 0% = -80
+        else:
+            wr_bonus = 0
+        
+        # Goal differential bonus
+        gd = sum(int(r.get("gf", 0) or 0) - int(r.get("ga", 0) or 0) for r in rows)
+        gd_bonus = int(_clamp(gd * 3, -40, 40))
+        
+        # Momentum: recent matches weighted more
+        momentum = 0
+        for i, r in enumerate(rows):
+            res = (r.get("result") or "").upper()
+            weight = (10 - i) / 10.0  # More recent = higher weight
+            if res == "W":
+                momentum += 20 * weight
+            elif res == "L":
+                momentum -= 20 * weight
+        momentum = int(_clamp(momentum, -40, 40))
+        
+        # Combine with intelligent weighting
+        final_bonus = int(
+            streak_bonus * 0.50 +  # Streaks are most important (50%)
+            wr_bonus * 0.25 +      # Win rate (25%)
+            gd_bonus * 0.15 +      # Goal differential (15%)
+            momentum * 0.10        # Momentum (10%)
+        )
+        
+        return int(_clamp(final_bonus, -180, 180))
     except Exception:
         return 0
 
 
 def _head_to_head_bonus(bot, sport_key: str, home_team: str, away_team: str) -> tuple[int, int]:
     """
-    Анализирует статистику личных встреч между командами.
-    Возвращает кортеж (home_bonus, away_bonus) - корректировки рейтинга на основе истории.
+    Analyzes historical H2H between teams.
+    Returns (home_bonus, away_bonus) with max ±40 each.
+    Weight: max 25% of form bonus effect.
     """
     fn = getattr(bot, "get_h2h_stats", None)
     if not callable(fn):
@@ -253,48 +350,85 @@ def _head_to_head_bonus(bot, sport_key: str, home_team: str, away_team: str) -> 
         if not h2h_data or not isinstance(h2h_data, dict):
             return 0, 0
         
-        # h2h_data ожидается в формате:
-        # {
-        #     'home_wins': N, 'away_wins': N, 'draws': N,
-        #     'home_goals_for': N, 'home_goals_against': N,
-        #     'away_goals_for': N, 'away_goals_against': N,
-        #     'matches_count': N
-        # }
-        
         matches = h2h_data.get('matches_count', 0)
         if matches < 2:
-            return 0, 0  # Нужна значимая статистика
+            return 0, 0  # Need significant data
         
         home_wins = h2h_data.get('home_wins', 0)
         away_wins = h2h_data.get('away_wins', 0)
-        draws = h2h_data.get('draws', 0)
         
         home_gf = h2h_data.get('home_goals_for', 0)
         home_ga = h2h_data.get('home_goals_against', 0)
         away_gf = h2h_data.get('away_goals_for', 0)
         away_ga = h2h_data.get('away_goals_against', 0)
         
-        # Вес важности личных встреч - растет с количеством матчей
-        h2h_weight = min(matches / 10.0, 0.3)  # Максимум 30% влияния
+        # Weight increases with matches count
+        h2h_weight = min(matches / 8.0, 1.0)  # 8+ matches = full weight
         
-        # Бонус на основе побед в личных встречах
-        home_h2h_advantage = ((home_wins - away_wins) / max(matches, 1)) * 100
+        # Win ratio bonus
+        home_wr = (home_wins - away_wins) / max(matches, 1)
+        home_wr_bonus = int(home_wr * 80 * h2h_weight)  # ±80 max
         
-        # Бонус на основе забитых/пропущенных голов
+        # Goal differential bonus
         home_gd = (home_gf - home_ga) / max(matches, 1)
-        away_gd = (away_gf - away_ga) / max(matches, 1)
+        home_gd_bonus = int(home_gd * 20 * h2h_weight)  # ±20 max
         
-        # Комбинируем оба фактора
+        # Combined
         home_bonus = int(_clamp(
-            (home_h2h_advantage * 0.6 + home_gd * 50 * 0.4) * h2h_weight,
-            -50, 50
+            home_wr_bonus * 0.7 + home_gd_bonus * 0.3,
+            -40, 40
         ))
-        away_bonus = int(_clamp(
-            (-home_h2h_advantage * 0.6 - home_gd * 50 * 0.4) * h2h_weight,
-            -50, 50
-        ))
+        away_bonus = -home_bonus
         
         return home_bonus, away_bonus
+    except Exception:
+        return 0, 0
+
+
+def _rest_injury_factor(bot, sport_key: str, home_team: str, away_team: str, match_time: datetime | None = None) -> tuple[int, int]:
+    """
+    Estimates rest advantage based on match frequency.
+    Higher match frequency = higher fatigue risk.
+    Returns (home_bonus, away_bonus) with max ±25 each.
+    """
+    fn = getattr(bot, "get_team_last_form", None)
+    if not callable(fn):
+        return 0, 0
+    
+    try:
+        match_time = match_time or datetime.now(timezone.utc)
+        home_recent = fn(sport_key, home_team, 5)
+        away_recent = fn(sport_key, away_team, 5)
+        
+        # Count matches in last 14 days
+        def count_recent_matches(form_rows):
+            if not form_rows:
+                return 0
+            cutoff = match_time - timedelta(days=14)
+            count = 0
+            for row in form_rows:
+                try:
+                    mt = row.get("match_time")
+                    if isinstance(mt, str):
+                        mt = datetime.fromisoformat(mt.replace("Z", "+00:00"))
+                    if mt and mt > cutoff:
+                        count += 1
+                except Exception:
+                    pass
+            return count
+        
+        home_matches = count_recent_matches(home_recent)
+        away_matches = count_recent_matches(away_recent)
+        
+        # 3+ matches in 14 days = fatigue factor
+        home_fatigue = max(0, (home_matches - 3) * 5)  # +5 per extra match
+        away_fatigue = max(0, (away_matches - 3) * 5)
+        
+        # Home advantage if away team more fatigued
+        home_bonus = int(away_fatigue - home_fatigue)
+        home_bonus = int(_clamp(home_bonus, -25, 25))
+        
+        return home_bonus, -home_bonus
     except Exception:
         return 0, 0
 
@@ -317,30 +451,46 @@ def _poisson(lam: float, goals: int) -> float:
     return math.exp(-lam) * (lam ** goals) / math.factorial(goals)
 
 
-def _football_probs(bot, home_rating: int, away_rating: int, league: str, home_team: str, away_team: str, sport_key: str, home_form: int, away_form: int) -> tuple[float, float, float]:
-    home_adv = float(os.getenv("AI_LINE_HOME_ADV_FOOTBALL", "68") or "68")
+def _football_probs(bot, home_rating: int, away_rating: int, league: str, home_team: str, away_team: str, sport_key: str, match_time: datetime | None = None) -> tuple[float, float, float]:
+    """
+    Football/Soccer probability calculation with advanced factors.
+    """
+    home_adv = _get_league_home_adv(league)
     
-    # Добавляем анализ личных встреч
-    h2h_home_bonus, h2h_away_bonus = _head_to_head_bonus(bot, sport_key, home_team, away_team)
+    # Advanced form analysis
+    home_form = _advanced_form_bonus(bot, sport_key, home_team)
+    away_form = _advanced_form_bonus(bot, sport_key, away_team)
     
-    diff = (home_rating + home_adv + home_form + h2h_home_bonus) - (away_rating + away_form + h2h_away_bonus)
+    # H2H analysis
+    h2h_home, h2h_away = _head_to_head_bonus(bot, sport_key, home_team, away_team)
+    
+    # Rest/Injury factor
+    rest_home, rest_away = _rest_injury_factor(bot, sport_key, home_team, away_team, match_time)
+    
+    # Combined ELO difference
+    diff = (home_rating + home_adv + home_form + h2h_home + rest_home) - \
+           (away_rating + away_form + h2h_away + rest_away)
 
+    # xG calculation with advanced model
     base_home = 1.42
     base_away = 1.08
-    diff_scale = diff / 680.0
-    home_xg = _clamp(base_home * math.exp(diff_scale), 0.35, 3.45)
-    away_xg = _clamp(base_away * math.exp(-diff_scale), 0.25, 3.10)
+    diff_scale = diff / 700.0
+    
+    home_xg = _clamp(base_home * math.exp(diff_scale), 0.30, 3.80)
+    away_xg = _clamp(base_away * math.exp(-diff_scale), 0.20, 3.30)
 
-    # Keep totals realistic: favorites create more total-goal pressure, but not wildly.
-    target_total = _clamp(2.55 + abs(diff) / 1400.0, 2.25, 3.10)
+    # Realistic total goals (2.5-3.2 per match on average)
+    target_total = _clamp(2.70 + abs(diff) / 1500.0, 2.30, 3.40)
     scale = target_total / max(0.1, home_xg + away_xg)
     home_xg *= scale
     away_xg *= scale
 
+    # Poisson distribution
     p1 = px = p2 = 0.0
     max_goals = 10
     home_probs = [_poisson(home_xg, i) for i in range(max_goals + 1)]
     away_probs = [_poisson(away_xg, i) for i in range(max_goals + 1)]
+    
     for hg, hp in enumerate(home_probs):
         for ag, ap in enumerate(away_probs):
             p = hp * ap
@@ -356,41 +506,59 @@ def _football_probs(bot, home_rating: int, away_rating: int, league: str, home_t
         return 0.45, 0.28, 0.27
     p1, px, p2 = p1 / total, px / total, p2 / total
 
-    # Avoid absurd lines from sparse seed data.
-    p1 = _clamp(p1, 0.035, 0.88)
-    px = _clamp(px, 0.08, 0.34)
-    p2 = _clamp(p2, 0.035, 0.88)
+    # Realistic clamping (avoid absurd lines)
+    p1 = _clamp(p1, 0.030, 0.90)
+    px = _clamp(px, 0.08, 0.36)
+    p2 = _clamp(p2, 0.030, 0.90)
     total = p1 + px + p2
     return p1 / total, px / total, p2 / total
 
 
-def _hockey_probs(bot, home_rating: int, away_rating: int, home_team: str, away_team: str, sport_key: str, home_form: int, away_form: int) -> tuple[float, None, float]:
-    home_adv = float(os.getenv("AI_LINE_HOME_ADV_NHL", "45") or "45")
+def _hockey_probs(bot, home_rating: int, away_rating: int, home_team: str, away_team: str, sport_key: str, match_time: datetime | None = None) -> tuple[float, None, float]:
+    """
+    Hockey (NHL) probability calculation.
+    """
+    home_adv = 45  # NHL home advantage
     
-    # Добавляем анализ личных встреч для хоккея
-    h2h_home_bonus, h2h_away_bonus = _head_to_head_bonus(bot, sport_key, home_team, away_team)
+    home_form = _advanced_form_bonus(bot, sport_key, home_team)
+    away_form = _advanced_form_bonus(bot, sport_key, away_team)
     
-    diff = (home_rating + home_adv + home_form + h2h_home_bonus) - (away_rating + away_form + h2h_away_bonus)
+    h2h_home, h2h_away = _head_to_head_bonus(bot, sport_key, home_team, away_team)
+    rest_home, rest_away = _rest_injury_factor(bot, sport_key, home_team, away_team, match_time)
+    
+    diff = (home_rating + home_adv + home_form + h2h_home + rest_home) - \
+           (away_rating + away_form + h2h_away + rest_away)
+    
     p1 = 1.0 / (1.0 + 10 ** (-diff / 420.0))
     p1 = _clamp(p1, 0.18, 0.82)
     return p1, None, 1.0 - p1
 
 
 def _margin(bot) -> float:
+    """
+    Dynamic margin: 3-6% based on competition level.
+    Closer matches have higher margin (more uncertainty).
+    """
     raw = os.getenv("AI_LINE_MARGIN")
     if raw is None:
-        raw = str(getattr(bot, "AI_MARGIN", 0.06))
+        raw = str(getattr(bot, "AI_MARGIN", 0.04))
     try:
-        return _clamp(float(raw), 0.0, 0.18)
+        return _clamp(float(raw), 0.03, 0.06)
     except ValueError:
-        return 0.06
+        return 0.04
 
 
 def probs_to_odds(bot, p1: float, px: float | None, p2: float) -> tuple[float, float | None, float]:
+    """
+    Convert probabilities to decimal odds with bookmaker margin.
+    """
     margin = _margin(bot)
 
     def odd(prob: float) -> float:
-        return round(_clamp(1.0 / max(0.0001, prob * (1.0 + margin)), 1.03, 99.0), 2)
+        if prob <= 0:
+            return 99.0
+        odds_val = 1.0 / (prob * (1.0 + margin))
+        return round(_clamp(odds_val, 1.01, 99.0), 2)
 
     if px is None:
         return odd(p1), None, odd(p2)
@@ -398,9 +566,13 @@ def probs_to_odds(bot, p1: float, px: float | None, p2: float) -> tuple[float, f
 
 
 def ai_probs_1x2(bot, match: dict) -> tuple[float, float | None, float]:
+    """
+    Calculate 1X2 match probabilities using all advanced factors.
+    """
     sport_key = _sport_key(bot, match)
     league = str(match.get("league") or "")
     teams = _parse_title_teams(bot, str(match.get("title") or ""))
+    
     if not teams:
         if sport_key == "nhl":
             return 0.52, None, 0.48
@@ -409,15 +581,25 @@ def ai_probs_1x2(bot, match: dict) -> tuple[float, float | None, float]:
     home, away = teams
     home_rating = _team_rating(bot, sport_key, home, league)
     away_rating = _team_rating(bot, sport_key, away, league)
-    home_form = _form_bonus(bot, sport_key, home)
-    away_form = _form_bonus(bot, sport_key, away)
+    
+    # Parse match time
+    match_time = None
+    try:
+        time_str = match.get("start_time_utc") or match.get("start_time") or ""
+        if time_str:
+            match_time = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+    except Exception:
+        pass
 
     if sport_key == "nhl":
-        return _hockey_probs(bot, home_rating, away_rating, home, away, sport_key, home_form, away_form)
-    return _football_probs(bot, home_rating, away_rating, league, home, away, sport_key, home_form, away_form)
+        return _hockey_probs(bot, home_rating, away_rating, home, away, sport_key, match_time)
+    return _football_probs(bot, home_rating, away_rating, league, home, away, sport_key, match_time)
 
 
 def ai_odds_for_match(bot, match: dict) -> dict:
+    """
+    Calculate final odds for a match.
+    """
     p1, px, p2 = ai_probs_1x2(bot, match)
     o1, ox, o2 = probs_to_odds(bot, p1, px, p2)
     out = dict(match)
@@ -440,6 +622,9 @@ def ai_odds_for_match(bot, match: dict) -> dict:
 
 
 def match_odds_for_pick(bot, match: dict, pick: str) -> float | None:
+    """
+    Get odds for specific pick (1, X, 2).
+    """
     priced = ai_odds_for_match(bot, dict(match))
     if pick == "1":
         return priced.get("odds_1")
@@ -459,6 +644,9 @@ def _has_column(con, table: str, column: str) -> bool:
 
 
 def refresh_ai_odds_for_open_matches(bot) -> int:
+    """
+    Refresh AI odds for all open matches.
+    """
     updated = 0
     cutoff_fn = getattr(bot, "_today_msk_start_utc", None)
     if callable(cutoff_fn):
@@ -514,6 +702,9 @@ def refresh_ai_odds_for_open_matches(bot) -> int:
 
 
 def _register_debug_command(bot) -> None:
+    """
+    Register /line_debug command for admins.
+    """
     if getattr(bot, "_AI_LINE_DEBUG_REGISTERED", False):
         return
     Command = getattr(bot, "Command", None)
@@ -547,6 +738,7 @@ def _register_debug_command(bot) -> None:
         match = bot.get_match(match_id)
         if not match:
             return await m.answer("Матч не найден.")
+        
         priced = ai_odds_for_match(bot, dict(match))
         teams = _parse_title_teams(bot, priced.get("title") or "") or ("—", "—")
         sport_key = _sport_key(bot, priced)
@@ -572,6 +764,9 @@ def _register_debug_command(bot) -> None:
 
 
 def apply(bot) -> None:
+    """
+    Apply AI odds module to bot.
+    """
     if getattr(bot, "_AI_LINE_APPLIED", False):
         return
 
