@@ -309,6 +309,24 @@ def apply_theme() -> None:
     except Exception as exc:
         logger.exception("silent results patch apply failed: %s", exc)
 
+    # ── Новые патчи ──────────────────────────────────────────────
+
+    try:
+        import real_odds_patch  # noqa: E402
+
+        real_odds_patch.apply(bot)
+        print("RUNNER_REAL_ODDS_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("real odds patch apply failed: %s", exc)
+
+    try:
+        import results_tab_patch  # noqa: E402
+
+        results_tab_patch.apply(bot)
+        print("RUNNER_RESULTS_TAB_PATCH_APPLIED")
+    except Exception as exc:
+        logger.exception("results tab patch apply failed: %s", exc)
+
 
 if __name__ == "__main__":
     apply_theme()
