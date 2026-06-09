@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-VERSION = "AI_LINE_V4"
+VERSION = "AI_LINE_V4_PRO"
 
 COMMON_ALIASES = {
     "man city": "manchester city",
@@ -164,6 +164,25 @@ LEAGUE_HOME_ADV = {
     "nhl": 45,
 }
 
+# Tennis surface factors (% advantage for specialists)
+TENNIS_SURFACES = {
+    "hard": {"fast": True, "speed": 1.0},     # US Open, Australian Open
+    "clay": {"fast": False, "speed": 0.85},   # French Open
+    "grass": {"fast": True, "speed": 1.1},    # Wimbledon (fastest)
+    "indoor": {"fast": True, "speed": 1.05},  # Most indoor tournaments
+}
+
+# Tennis tournament levels
+TENNIS_TOURNAMENT_LEVELS = {
+    "grand slam": 100,
+    "atp finals": 95,
+    "masters": 85,
+    "atp 500": 75,
+    "atp 250": 60,
+    "challenger": 40,
+    "itf": 20,
+}
+
 
 def _norm(value: Any) -> str:
     s = str(value or "").casefold().strip()
@@ -205,7 +224,11 @@ def _sport_key(bot, match: dict) -> str:
     if callable(fn):
         return fn(match.get("sport"), match.get("league"))
     s = f"{match.get('sport') or ''} {match.get('league') or ''}".casefold()
-    return "nhl" if "nhl" in s or "hockey" in s else "football"
+    if "nhl" in s or "hockey" in s:
+        return "nhl"
+    if "tennis" in s:
+        return "tennis"
+    return "football"
 
 
 def _league_base(league: str, sport_key: str) -> int:
@@ -251,11 +274,7 @@ def _db_rating(bot, sport_key: str, team: str) -> int | None:
 
 def _advanced_form_bonus(bot, sport_key: str, team: str) -> int:
     """
-    Advanced form analysis with:
-    - Streak bonuses (exponential)
-    - Win rate percentage
-    - Goal differential
-    - Momentum curve
+    Advanced form analysis for football/hockey.
     Returns: [-180..+180]
     """
     fn = getattr(bot, "get_team_last_form", None)
@@ -263,7 +282,7 @@ def _advanced_form_bonus(bot, sport_key: str, team: str) -> int:
         return 0
     
     try:
-        rows = fn(sport_key, team, 10)  # Last 10 matches
+        rows = fn(sport_key, team, 10)
         if not rows:
             return 0
         
@@ -281,53 +300,48 @@ def _advanced_form_bonus(bot, sport_key: str, team: str) -> int:
             else:
                 break
         
-        # Streak bonus (exponential, more aggressive)
+        # Streak bonus
         if consecutive_wins >= 5:
-            streak_bonus = min(180, 40 + 28 * consecutive_wins)  # 5 wins = +180
+            streak_bonus = min(180, 40 + 28 * consecutive_wins)
         elif consecutive_wins > 0:
             streak_bonus = min(100, 20 + 16 * consecutive_wins)
         elif consecutive_losses >= 5:
-            streak_bonus = max(-180, -40 - 28 * consecutive_losses)  # 5 losses = -180
+            streak_bonus = max(-180, -40 - 28 * consecutive_losses)
         elif consecutive_losses > 0:
             streak_bonus = max(-100, -20 - 16 * consecutive_losses)
         else:
             streak_bonus = 0
         
-        # Overall win rate (last 10)
+        # Win rate
         wins = sum(1 for r in rows if (r.get("result") or "").upper() == "W")
-        losses = sum(1 for r in rows if (r.get("result") or "").upper() == "L")
-        draws = sum(1 for r in rows if (r.get("result") or "").upper() == "D")
-        
-        # Win rate bonus
         win_rate = wins / max(len(rows), 1)
         if win_rate > 0.6:
-            wr_bonus = int(40 + (win_rate - 0.6) * 200)  # 100% = +80
+            wr_bonus = int(40 + (win_rate - 0.6) * 200)
         elif win_rate < 0.4:
-            wr_bonus = int(-40 + (win_rate - 0.4) * 200)  # 0% = -80
+            wr_bonus = int(-40 + (win_rate - 0.4) * 200)
         else:
             wr_bonus = 0
         
-        # Goal differential bonus
+        # Goal differential
         gd = sum(int(r.get("gf", 0) or 0) - int(r.get("ga", 0) or 0) for r in rows)
         gd_bonus = int(_clamp(gd * 3, -40, 40))
         
-        # Momentum: recent matches weighted more
+        # Momentum
         momentum = 0
         for i, r in enumerate(rows):
             res = (r.get("result") or "").upper()
-            weight = (10 - i) / 10.0  # More recent = higher weight
+            weight = (10 - i) / 10.0
             if res == "W":
                 momentum += 20 * weight
             elif res == "L":
                 momentum -= 20 * weight
         momentum = int(_clamp(momentum, -40, 40))
         
-        # Combine with intelligent weighting
         final_bonus = int(
-            streak_bonus * 0.50 +  # Streaks are most important (50%)
-            wr_bonus * 0.25 +      # Win rate (25%)
-            gd_bonus * 0.15 +      # Goal differential (15%)
-            momentum * 0.10        # Momentum (10%)
+            streak_bonus * 0.50 +
+            wr_bonus * 0.25 +
+            gd_bonus * 0.15 +
+            momentum * 0.10
         )
         
         return int(_clamp(final_bonus, -180, 180))
@@ -335,12 +349,263 @@ def _advanced_form_bonus(bot, sport_key: str, team: str) -> int:
         return 0
 
 
+def _tennis_form_bonus(bot, sport_key: str, player: str) -> int:
+    """
+    Advanced form analysis for tennis (more aggressive).
+    Returns: [-200..+200]
+    """
+    fn = getattr(bot, "get_team_last_form", None)
+    if not callable(fn):
+        return 0
+    
+    try:
+        rows = fn(sport_key, player, 10)
+        if not rows:
+            return 0
+        
+        # Consecutive wins/losses
+        consecutive_wins = 0
+        consecutive_losses = 0
+        for r in rows:
+            res = (r.get("result") or "").upper()
+            if res == "W":
+                consecutive_wins += 1
+                consecutive_losses = 0
+            elif res == "L":
+                consecutive_losses += 1
+                consecutive_wins = 0
+            else:
+                break
+        
+        # Tennis: VERY aggressive streak bonus (form is critical)
+        if consecutive_wins >= 5:
+            streak_bonus = min(200, 50 + 30 * consecutive_wins)  # 5+ wins = +200
+        elif consecutive_wins > 0:
+            streak_bonus = min(120, 25 + 20 * consecutive_wins)
+        elif consecutive_losses >= 5:
+            streak_bonus = max(-200, -50 - 30 * consecutive_losses)  # 5+ losses = -200
+        elif consecutive_losses > 0:
+            streak_bonus = max(-120, -25 - 20 * consecutive_losses)
+        else:
+            streak_bonus = 0
+        
+        # Win rate (very important in tennis)
+        wins = sum(1 for r in rows if (r.get("result") or "").upper() == "W")
+        win_rate = wins / max(len(rows), 1)
+        if win_rate > 0.7:
+            wr_bonus = int(60 + (win_rate - 0.7) * 300)  # 100% = +90
+        elif win_rate < 0.3:
+            wr_bonus = int(-60 + (win_rate - 0.3) * 300)  # 0% = -90
+        else:
+            wr_bonus = int((win_rate - 0.5) * 200)
+        
+        # Set differential (tennis-specific)
+        sets_won = sum(int(r.get("gf", 0) or 0) for r in rows)  # gf = sets won
+        sets_total = sum(int(r.get("gf", 0) or 0) + int(r.get("ga", 0) or 0) for r in rows)
+        set_diff = (sets_won - (sets_total - sets_won)) / max(sets_total, 1)
+        set_bonus = int(_clamp(set_diff * 250, -60, 60))
+        
+        # Recent momentum (last 3 matches weighted heavily)
+        momentum = 0
+        for i, r in enumerate(rows[:3]):
+            res = (r.get("result") or "").upper()
+            weight = (3 - i) / 3.0
+            if res == "W":
+                momentum += 40 * weight  # Double weight for tennis
+            elif res == "L":
+                momentum -= 40 * weight
+        momentum = int(_clamp(momentum, -60, 60))
+        
+        # Tennis weighting: form is everything!
+        final_bonus = int(
+            streak_bonus * 0.55 +   # Streaks ultra-important (55%)
+            wr_bonus * 0.25 +       # Win rate (25%)
+            set_bonus * 0.12 +      # Set differential (12%)
+            momentum * 0.08         # Momentum (8%)
+        )
+        
+        return int(_clamp(final_bonus, -200, 200))
+    except Exception:
+        return 0
+
+
+def _tennis_surface_bonus(bot, player: str, surface: str) -> int:
+    """
+    Calculate surface advantage for tennis player.
+    Returns: [-80..+80]
+    """
+    fn = getattr(bot, "get_player_surface_stats", None)
+    if not callable(fn):
+        return 0
+    
+    try:
+        surface = (surface or "").lower().strip()
+        if not surface:
+            return 0
+        
+        # Get player's surface statistics
+        stats = fn(player, surface)
+        if not stats or not isinstance(stats, dict):
+            return 0
+        
+        wins = stats.get("wins", 0)
+        losses = stats.get("losses", 0)
+        total = wins + losses
+        
+        if total < 3:  # Need significant sample
+            return 0
+        
+        win_rate = wins / max(total, 1)
+        
+        # Specialists get big bonus, poor performers get penalty
+        if win_rate > 0.65:
+            bonus = int(30 + (win_rate - 0.65) * 300)  # Up to +80
+        elif win_rate < 0.35:
+            bonus = int(-30 + (win_rate - 0.35) * 300)  # Down to -80
+        else:
+            bonus = int((win_rate - 0.5) * 160)
+        
+        # Weight by sample size (more matches = more confident)
+        confidence = min(total / 20.0, 1.0)
+        return int(bonus * confidence)
+    except Exception:
+        return 0
+
+
+def _tennis_h2h_bonus(bot, player1: str, player2: str) -> tuple[int, int]:
+    """
+    H2H analysis for tennis (VERY important, up to ±150 each).
+    Returns: (player1_bonus, player2_bonus)
+    """
+    fn = getattr(bot, "get_tennis_h2h", None)
+    if not callable(fn):
+        return 0, 0
+    
+    try:
+        h2h_data = fn(player1, player2)
+        if not h2h_data or not isinstance(h2h_data, dict):
+            return 0, 0
+        
+        p1_wins = h2h_data.get("player1_wins", 0)
+        p2_wins = h2h_data.get("player2_wins", 0)
+        total = p1_wins + p2_wins
+        
+        if total < 2:
+            return 0, 0
+        
+        # Win rate in H2H
+        p1_wr = p1_wins / max(total, 1)
+        p2_wr = p2_wins / max(total, 1)
+        
+        # Tennis: H2H DOMINANCE is everything!
+        # If dominated 70% = +150 bonus
+        if p1_wr > 0.65:
+            p1_bonus = int(50 + (p1_wr - 0.65) * 500)  # Up to +150
+        elif p1_wr < 0.35:
+            p1_bonus = int(-50 + (p1_wr - 0.35) * 500)  # Down to -150
+        else:
+            p1_bonus = int((p1_wr - 0.5) * 300)
+        
+        p1_bonus = int(_clamp(p1_bonus, -150, 150))
+        p2_bonus = -p1_bonus
+        
+        # Weight by matches count
+        confidence = min(total / 15.0, 1.0)
+        return int(p1_bonus * confidence), int(p2_bonus * confidence)
+    except Exception:
+        return 0, 0
+
+
+def _tennis_injury_factor(bot, player: str) -> int:
+    """
+    Injury tracking for tennis (CRITICAL, up to -200!).
+    Returns: bonus/penalty [-200..0]
+    """
+    fn = getattr(bot, "get_player_injury_status", None)
+    if not callable(fn):
+        return 0
+    
+    try:
+        injury_data = fn(player)
+        if not injury_data or not isinstance(injury_data, dict):
+            return 0
+        
+        is_injured = injury_data.get("is_injured", False)
+        severity = injury_data.get("severity", 0)  # 0-10 scale
+        recovery_days = injury_data.get("recovery_days", 0)
+        
+        if not is_injured:
+            # Returning from injury? Gradual recovery
+            if recovery_days and recovery_days < 30:
+                penalty = int(-50 * (30 - recovery_days) / 30.0)
+                return penalty
+            return 0
+        
+        # Active injury: HUGE penalty
+        if severity >= 8:
+            return -200  # Severe injury = play canceled
+        elif severity >= 5:
+            return -150  # Major injury
+        elif severity >= 3:
+            return -100  # Moderate injury
+        else:
+            return -50   # Minor injury
+    except Exception:
+        return 0
+
+
+def _tennis_experience_bonus(bot, player: str, tournament_level: int) -> int:
+    """
+    Age and experience factor for tennis.
+    Returns: [-60..+60]
+    """
+    fn = getattr(bot, "get_player_experience", None)
+    if not callable(fn):
+        return 0
+    
+    try:
+        exp_data = fn(player)
+        if not exp_data:
+            return 0
+        
+        age = exp_data.get("age", 25)
+        years_pro = exp_data.get("years_pro", 5)
+        career_titles = exp_data.get("titles", 0)
+        grand_slam_titles = exp_data.get("grand_slam_titles", 0)
+        
+        # Peak age: 26-28
+        if 26 <= age <= 28:
+            age_bonus = 30
+        elif 23 <= age <= 32:
+            age_bonus = 20
+        elif 20 <= age <= 35:
+            age_bonus = 10
+        else:
+            age_bonus = -30
+        
+        # Experience matters in big tournaments
+        if tournament_level >= 90:  # Grand Slam
+            if grand_slam_titles >= 1:
+                exp_bonus = min(40, 10 + grand_slam_titles * 15)
+            else:
+                exp_bonus = -20  # No GS experience in big tournament
+        else:
+            exp_bonus = min(20, years_pro * 4)
+        
+        total = int((age_bonus + exp_bonus) / 2)
+        return int(_clamp(total, -60, 60))
+    except Exception:
+        return 0
+
+
 def _head_to_head_bonus(bot, sport_key: str, home_team: str, away_team: str) -> tuple[int, int]:
     """
-    Analyzes historical H2H between teams.
-    Returns (home_bonus, away_bonus) with max ±40 each.
-    Weight: max 25% of form bonus effect.
+    H2H for football/hockey (not tennis).
+    Returns (home_bonus, away_bonus) [-40..+40]
     """
+    if sport_key == "tennis":
+        return 0, 0
+    
     fn = getattr(bot, "get_h2h_stats", None)
     if not callable(fn):
         return 0, 0
@@ -352,28 +617,22 @@ def _head_to_head_bonus(bot, sport_key: str, home_team: str, away_team: str) -> 
         
         matches = h2h_data.get('matches_count', 0)
         if matches < 2:
-            return 0, 0  # Need significant data
+            return 0, 0
         
         home_wins = h2h_data.get('home_wins', 0)
         away_wins = h2h_data.get('away_wins', 0)
         
         home_gf = h2h_data.get('home_goals_for', 0)
         home_ga = h2h_data.get('home_goals_against', 0)
-        away_gf = h2h_data.get('away_goals_for', 0)
-        away_ga = h2h_data.get('away_goals_against', 0)
         
-        # Weight increases with matches count
-        h2h_weight = min(matches / 8.0, 1.0)  # 8+ matches = full weight
+        h2h_weight = min(matches / 8.0, 1.0)
         
-        # Win ratio bonus
         home_wr = (home_wins - away_wins) / max(matches, 1)
-        home_wr_bonus = int(home_wr * 80 * h2h_weight)  # ±80 max
+        home_wr_bonus = int(home_wr * 80 * h2h_weight)
         
-        # Goal differential bonus
         home_gd = (home_gf - home_ga) / max(matches, 1)
-        home_gd_bonus = int(home_gd * 20 * h2h_weight)  # ±20 max
+        home_gd_bonus = int(home_gd * 20 * h2h_weight)
         
-        # Combined
         home_bonus = int(_clamp(
             home_wr_bonus * 0.7 + home_gd_bonus * 0.3,
             -40, 40
@@ -387,10 +646,11 @@ def _head_to_head_bonus(bot, sport_key: str, home_team: str, away_team: str) -> 
 
 def _rest_injury_factor(bot, sport_key: str, home_team: str, away_team: str, match_time: datetime | None = None) -> tuple[int, int]:
     """
-    Estimates rest advantage based on match frequency.
-    Higher match frequency = higher fatigue risk.
-    Returns (home_bonus, away_bonus) with max ±25 each.
+    Rest factor for football/hockey (not tennis).
     """
+    if sport_key == "tennis":
+        return 0, 0
+    
     fn = getattr(bot, "get_team_last_form", None)
     if not callable(fn):
         return 0, 0
@@ -400,7 +660,6 @@ def _rest_injury_factor(bot, sport_key: str, home_team: str, away_team: str, mat
         home_recent = fn(sport_key, home_team, 5)
         away_recent = fn(sport_key, away_team, 5)
         
-        # Count matches in last 14 days
         def count_recent_matches(form_rows):
             if not form_rows:
                 return 0
@@ -420,11 +679,9 @@ def _rest_injury_factor(bot, sport_key: str, home_team: str, away_team: str, mat
         home_matches = count_recent_matches(home_recent)
         away_matches = count_recent_matches(away_recent)
         
-        # 3+ matches in 14 days = fatigue factor
-        home_fatigue = max(0, (home_matches - 3) * 5)  # +5 per extra match
+        home_fatigue = max(0, (home_matches - 3) * 5)
         away_fatigue = max(0, (away_matches - 3) * 5)
         
-        # Home advantage if away team more fatigued
         home_bonus = int(away_fatigue - home_fatigue)
         home_bonus = int(_clamp(home_bonus, -25, 25))
         
@@ -457,21 +714,16 @@ def _football_probs(bot, home_rating: int, away_rating: int, league: str, home_t
     """
     home_adv = _get_league_home_adv(league)
     
-    # Advanced form analysis
     home_form = _advanced_form_bonus(bot, sport_key, home_team)
     away_form = _advanced_form_bonus(bot, sport_key, away_team)
     
-    # H2H analysis
     h2h_home, h2h_away = _head_to_head_bonus(bot, sport_key, home_team, away_team)
     
-    # Rest/Injury factor
     rest_home, rest_away = _rest_injury_factor(bot, sport_key, home_team, away_team, match_time)
     
-    # Combined ELO difference
     diff = (home_rating + home_adv + home_form + h2h_home + rest_home) - \
            (away_rating + away_form + h2h_away + rest_away)
 
-    # xG calculation with advanced model
     base_home = 1.42
     base_away = 1.08
     diff_scale = diff / 700.0
@@ -479,13 +731,11 @@ def _football_probs(bot, home_rating: int, away_rating: int, league: str, home_t
     home_xg = _clamp(base_home * math.exp(diff_scale), 0.30, 3.80)
     away_xg = _clamp(base_away * math.exp(-diff_scale), 0.20, 3.30)
 
-    # Realistic total goals (2.5-3.2 per match on average)
     target_total = _clamp(2.70 + abs(diff) / 1500.0, 2.30, 3.40)
     scale = target_total / max(0.1, home_xg + away_xg)
     home_xg *= scale
     away_xg *= scale
 
-    # Poisson distribution
     p1 = px = p2 = 0.0
     max_goals = 10
     home_probs = [_poisson(home_xg, i) for i in range(max_goals + 1)]
@@ -506,7 +756,6 @@ def _football_probs(bot, home_rating: int, away_rating: int, league: str, home_t
         return 0.45, 0.28, 0.27
     p1, px, p2 = p1 / total, px / total, p2 / total
 
-    # Realistic clamping (avoid absurd lines)
     p1 = _clamp(p1, 0.030, 0.90)
     px = _clamp(px, 0.08, 0.36)
     p2 = _clamp(p2, 0.030, 0.90)
@@ -518,7 +767,7 @@ def _hockey_probs(bot, home_rating: int, away_rating: int, home_team: str, away_
     """
     Hockey (NHL) probability calculation.
     """
-    home_adv = 45  # NHL home advantage
+    home_adv = 45
     
     home_form = _advanced_form_bonus(bot, sport_key, home_team)
     away_form = _advanced_form_bonus(bot, sport_key, away_team)
@@ -534,16 +783,69 @@ def _hockey_probs(bot, home_rating: int, away_rating: int, home_team: str, away_
     return p1, None, 1.0 - p1
 
 
+def _tennis_probs(bot, player1_rating: int, player2_rating: int, player1: str, player2: str, surface: str, tournament_level: int, match_time: datetime | None = None) -> tuple[float, float]:
+    """
+    Tennis probability calculation with advanced factors (NO DRAW).
+    Returns (player1_prob, player2_prob)
+    """
+    # Form bonus (critical in tennis)
+    p1_form = _tennis_form_bonus(bot, "tennis", player1)
+    p2_form = _tennis_form_bonus(bot, "tennis", player2)
+    
+    # Surface advantage
+    p1_surface = _tennis_surface_bonus(bot, player1, surface)
+    p2_surface = _tennis_surface_bonus(bot, player2, surface)
+    
+    # H2H dominance (VERY important)
+    p1_h2h, p2_h2h = _tennis_h2h_bonus(bot, player1, player2)
+    
+    # Injuries (CRITICAL)
+    p1_injury = _tennis_injury_factor(bot, player1)
+    p2_injury = _tennis_injury_factor(bot, player2)
+    
+    # Experience/age bonus
+    p1_exp = _tennis_experience_bonus(bot, player1, tournament_level)
+    p2_exp = _tennis_experience_bonus(bot, player2, tournament_level)
+    
+    # Combined ELO difference
+    # Weighting: Form(35%) + H2H(30%) + Injury(20%) + Surface(10%) + Experience(5%)
+    p1_bonus = int(
+        p1_form * 0.35 +
+        p1_h2h * 0.30 +
+        p1_injury * 0.20 +
+        p1_surface * 0.10 +
+        p1_exp * 0.05
+    )
+    
+    p2_bonus = int(
+        p2_form * 0.35 +
+        p2_h2h * 0.30 +
+        p2_injury * 0.20 +
+        p2_surface * 0.10 +
+        p2_exp * 0.05
+    )
+    
+    diff = (player1_rating + p1_bonus) - (player2_rating + p2_bonus)
+    
+    # Tennis: sigmoid curve is tighter (matches are more competitive)
+    p1_win = 1.0 / (1.0 + 10 ** (-diff / 400.0))
+    
+    # Clamp to reasonable values
+    p1_win = _clamp(p1_win, 0.05, 0.95)
+    p2_win = 1.0 - p1_win
+    
+    return p1_win, p2_win
+
+
 def _margin(bot) -> float:
     """
-    Dynamic margin: 3-6% based on competition level.
-    Closer matches have higher margin (more uncertainty).
+    Dynamic margin: 3-6% for team sports, 4-8% for tennis.
     """
     raw = os.getenv("AI_LINE_MARGIN")
     if raw is None:
         raw = str(getattr(bot, "AI_MARGIN", 0.04))
     try:
-        return _clamp(float(raw), 0.03, 0.06)
+        return _clamp(float(raw), 0.03, 0.08)
     except ValueError:
         return 0.04
 
@@ -567,7 +869,7 @@ def probs_to_odds(bot, p1: float, px: float | None, p2: float) -> tuple[float, f
 
 def ai_probs_1x2(bot, match: dict) -> tuple[float, float | None, float]:
     """
-    Calculate 1X2 match probabilities using all advanced factors.
+    Calculate 1X2 match probabilities (football/hockey).
     """
     sport_key = _sport_key(bot, match)
     league = str(match.get("league") or "")
@@ -582,7 +884,6 @@ def ai_probs_1x2(bot, match: dict) -> tuple[float, float | None, float]:
     home_rating = _team_rating(bot, sport_key, home, league)
     away_rating = _team_rating(bot, sport_key, away, league)
     
-    # Parse match time
     match_time = None
     try:
         time_str = match.get("start_time_utc") or match.get("start_time") or ""
@@ -596,23 +897,74 @@ def ai_probs_1x2(bot, match: dict) -> tuple[float, float | None, float]:
     return _football_probs(bot, home_rating, away_rating, league, home, away, sport_key, match_time)
 
 
+def ai_probs_12(bot, match: dict) -> tuple[float, float]:
+    """
+    Calculate 1/2 match probabilities (tennis).
+    Returns (player1_prob, player2_prob) - NO DRAW
+    """
+    sport_key = _sport_key(bot, match)
+    
+    if sport_key != "tennis":
+        # Fallback to 1X2
+        p1, px, p2 = ai_probs_1x2(bot, match)
+        return (p1 / (p1 + p2), p2 / (p1 + p2))
+    
+    teams = _parse_title_teams(bot, str(match.get("title") or ""))
+    if not teams:
+        return 0.50, 0.50
+    
+    player1, player2 = teams
+    surface = (match.get("surface") or "hard").lower()
+    tournament = str(match.get("league") or "ATP 250")
+    tournament_level = TENNIS_TOURNAMENT_LEVELS.get(tournament.lower(), 60)
+    
+    p1_rating = _db_rating(bot, "tennis", player1) or 1500
+    p2_rating = _db_rating(bot, "tennis", player2) or 1500
+    
+    match_time = None
+    try:
+        time_str = match.get("start_time_utc") or match.get("start_time") or ""
+        if time_str:
+            match_time = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    
+    return _tennis_probs(bot, p1_rating, p2_rating, player1, player2, surface, tournament_level, match_time)
+
+
 def ai_odds_for_match(bot, match: dict) -> dict:
     """
-    Calculate final odds for a match.
+    Calculate final odds for any sport.
     """
-    p1, px, p2 = ai_probs_1x2(bot, match)
-    o1, ox, o2 = probs_to_odds(bot, p1, px, p2)
+    sport_key = _sport_key(bot, match)
     out = dict(match)
     teams = _parse_title_teams(bot, str(match.get("title") or ""))
+    
     if teams:
         out["home_team"] = teams[0]
         out["away_team"] = teams[1]
-    out["prob_1"] = round(p1, 4)
-    out["prob_x"] = None if px is None else round(px, 4)
-    out["prob_2"] = round(p2, 4)
-    out["odds_1"] = o1
-    out["odds_x"] = ox
-    out["odds_2"] = o2
+    
+    if sport_key == "tennis":
+        # Tennis: 1/2 format
+        p1, p2 = ai_probs_12(bot, match)
+        o1, o2 = probs_to_odds(bot, p1, None, p2)
+        out["prob_1"] = round(p1, 4)
+        out["prob_x"] = None
+        out["prob_2"] = round(p2, 4)
+        out["odds_1"] = o1
+        out["odds_x"] = None
+        out["odds_2"] = o2
+    else:
+        # Football/Hockey: 1X2 format
+        p1, px, p2 = ai_probs_1x2(bot, match)
+        o1, ox, o2 = probs_to_odds(bot, p1, px, p2)
+        out["prob_1"] = round(p1, 4)
+        out["prob_x"] = None if px is None else round(px, 4)
+        out["prob_2"] = round(p2, 4)
+        out["odds_1"] = o1
+        out["odds_x"] = ox
+        out["odds_2"] = o2
+    
     out["odds_source"] = VERSION
     try:
         out["odds_updated_at"] = bot.iso(bot.now_utc())
@@ -623,7 +975,7 @@ def ai_odds_for_match(bot, match: dict) -> dict:
 
 def match_odds_for_pick(bot, match: dict, pick: str) -> float | None:
     """
-    Get odds for specific pick (1, X, 2).
+    Get odds for specific pick (1, X, 2 for team sports; 1, 2 for tennis).
     """
     priced = ai_odds_for_match(bot, dict(match))
     if pick == "1":
@@ -742,22 +1094,35 @@ def _register_debug_command(bot) -> None:
         priced = ai_odds_for_match(bot, dict(match))
         teams = _parse_title_teams(bot, priced.get("title") or "") or ("—", "—")
         sport_key = _sport_key(bot, priced)
-        home_rating = _team_rating(bot, sport_key, teams[0], priced.get("league") or "") if teams[0] != "—" else 0
-        away_rating = _team_rating(bot, sport_key, teams[1], priced.get("league") or "") if teams[1] != "—" else 0
-
-        text = (
-            f"<b>{VERSION}</b>\n"
-            f"Матч #{match_id}: <b>{priced.get('title')}</b>\n"
-            f"Рейтинг: {teams[0]} <b>{home_rating}</b> — {teams[1]} <b>{away_rating}</b>\n"
-            f"Вероятности: П1 <b>{priced.get('prob_1'):.1%}</b>"
-        )
-        if priced.get("prob_x") is not None:
-            text += f" · X <b>{priced.get('prob_x'):.1%}</b>"
-        text += f" · П2 <b>{priced.get('prob_2'):.1%}</b>\n"
-        text += f"КФ: П1 <b>{priced.get('odds_1')}</b>"
-        if priced.get("odds_x") is not None:
-            text += f" · X <b>{priced.get('odds_x')}</b>"
-        text += f" · П2 <b>{priced.get('odds_2')}</b>"
+        
+        if sport_key == "tennis":
+            p1_rating = _db_rating(bot, "tennis", teams[0]) or 1500
+            p2_rating = _db_rating(bot, "tennis", teams[1]) or 1500
+            text = (
+                f"<b>{VERSION} - TENNIS</b>\n"
+                f"Матч #{match_id}: <b>{priced.get('title')}</b>\n"
+                f"Рейтинг: {teams[0]} <b>{p1_rating}</b> — {teams[1]} <b>{p2_rating}</b>\n"
+                f"Поверхность: <b>{priced.get('surface', 'unknown').upper()}</b>\n"
+                f"Вероятности: P1 <b>{priced.get('prob_1'):.1%}</b> · P2 <b>{priced.get('prob_2'):.1%}</b>\n"
+                f"КФ: P1 <b>{priced.get('odds_1')}</b> · P2 <b>{priced.get('odds_2')}</b>"
+            )
+        else:
+            home_rating = _team_rating(bot, sport_key, teams[0], priced.get("league") or "") if teams[0] != "—" else 0
+            away_rating = _team_rating(bot, sport_key, teams[1], priced.get("league") or "") if teams[1] != "—" else 0
+            text = (
+                f"<b>{VERSION} - {sport_key.upper()}</b>\n"
+                f"Матч #{match_id}: <b>{priced.get('title')}</b>\n"
+                f"Рейтинг: {teams[0]} <b>{home_rating}</b> — {teams[1]} <b>{away_rating}</b>\n"
+                f"Вероятности: П1 <b>{priced.get('prob_1'):.1%}</b>"
+            )
+            if priced.get("prob_x") is not None:
+                text += f" · X <b>{priced.get('prob_x'):.1%}</b>"
+            text += f" · П2 <b>{priced.get('prob_2'):.1%}</b>\n"
+            text += f"КФ: П1 <b>{priced.get('odds_1')}</b>"
+            if priced.get("odds_x") is not None:
+                text += f" · X <b>{priced.get('odds_x')}</b>"
+            text += f" · П2 <b>{priced.get('odds_2')}</b>"
+        
         await m.answer(text)
 
     bot._AI_LINE_DEBUG_REGISTERED = True
@@ -771,6 +1136,7 @@ def apply(bot) -> None:
         return
 
     bot.ai_probs_1x2 = lambda match: ai_probs_1x2(bot, match)
+    bot.ai_probs_12 = lambda match: ai_probs_12(bot, match)
     bot.probs_to_odds = lambda p1, px, p2: probs_to_odds(bot, p1, px, p2)
     bot.ai_odds_for_match = lambda match: ai_odds_for_match(bot, match)
     bot.match_odds_for_pick = lambda match, pick: match_odds_for_pick(bot, match, pick)
