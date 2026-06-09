@@ -707,6 +707,10 @@ function patchRenderMatches() {
       } else {
         card.insertAdjacentHTML('beforeend', sourceHtml);
       }
+      // Убрать дублирующий нижний блок AI-прогноза (от других патчей)
+      card.querySelectorAll('.ai-strip, [class*="market-strip"]').forEach(el => {
+        if(card.querySelector('.odds-source-row')) el.remove();
+      });
     });
   };
   window.__roRenderMatchesWrapped = true;
