@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-VERSION = "AI_LINE_V2"
+VERSION = "AI_LINE_V3"
 
 COMMON_ALIASES = {
     "man city": "manchester city",
@@ -239,6 +239,66 @@ def _form_bonus(bot, sport_key: str, team: str) -> int:
         return 0
 
 
+def _head_to_head_bonus(bot, sport_key: str, home_team: str, away_team: str) -> tuple[int, int]:
+    """
+    Анализирует статистику личных встреч между командами.
+    Возвращает кортеж (home_bonus, away_bonus) - корректировки рейтинга на основе истории.
+    """
+    fn = getattr(bot, "get_h2h_stats", None)
+    if not callable(fn):
+        return 0, 0
+    
+    try:
+        h2h_data = fn(sport_key, home_team, away_team)
+        if not h2h_data or not isinstance(h2h_data, dict):
+            return 0, 0
+        
+        # h2h_data ожидается в формате:
+        # {
+        #     'home_wins': N, 'away_wins': N, 'draws': N,
+        #     'home_goals_for': N, 'home_goals_against': N,
+        #     'away_goals_for': N, 'away_goals_against': N,
+        #     'matches_count': N
+        # }
+        
+        matches = h2h_data.get('matches_count', 0)
+        if matches < 2:
+            return 0, 0  # Нужна значимая статистика
+        
+        home_wins = h2h_data.get('home_wins', 0)
+        away_wins = h2h_data.get('away_wins', 0)
+        draws = h2h_data.get('draws', 0)
+        
+        home_gf = h2h_data.get('home_goals_for', 0)
+        home_ga = h2h_data.get('home_goals_against', 0)
+        away_gf = h2h_data.get('away_goals_for', 0)
+        away_ga = h2h_data.get('away_goals_against', 0)
+        
+        # Вес важности личных встреч - растет с количеством матчей
+        h2h_weight = min(matches / 10.0, 0.3)  # Максимум 30% влияния
+        
+        # Бонус на основе побед в личных встречах
+        home_h2h_advantage = ((home_wins - away_wins) / max(matches, 1)) * 100
+        
+        # Бонус на основе забитых/пропущенных голов
+        home_gd = (home_gf - home_ga) / max(matches, 1)
+        away_gd = (away_gf - away_ga) / max(matches, 1)
+        
+        # Комбинируем оба фактора
+        home_bonus = int(_clamp(
+            (home_h2h_advantage * 0.6 + home_gd * 50 * 0.4) * h2h_weight,
+            -50, 50
+        ))
+        away_bonus = int(_clamp(
+            (-home_h2h_advantage * 0.6 - home_gd * 50 * 0.4) * h2h_weight,
+            -50, 50
+        ))
+        
+        return home_bonus, away_bonus
+    except Exception:
+        return 0, 0
+
+
 def _team_rating(bot, sport_key: str, team: str, league: str) -> int:
     normalized = _norm(team)
     seeded = TEAM_POWER.get(normalized)
@@ -257,9 +317,13 @@ def _poisson(lam: float, goals: int) -> float:
     return math.exp(-lam) * (lam ** goals) / math.factorial(goals)
 
 
-def _football_probs(home_rating: int, away_rating: int, league: str, home_form: int, away_form: int) -> tuple[float, float, float]:
+def _football_probs(bot, home_rating: int, away_rating: int, league: str, home_team: str, away_team: str, sport_key: str, home_form: int, away_form: int) -> tuple[float, float, float]:
     home_adv = float(os.getenv("AI_LINE_HOME_ADV_FOOTBALL", "68") or "68")
-    diff = (home_rating + home_adv + home_form) - (away_rating + away_form)
+    
+    # Добавляем анализ личных встреч
+    h2h_home_bonus, h2h_away_bonus = _head_to_head_bonus(bot, sport_key, home_team, away_team)
+    
+    diff = (home_rating + home_adv + home_form + h2h_home_bonus) - (away_rating + away_form + h2h_away_bonus)
 
     base_home = 1.42
     base_away = 1.08
@@ -300,9 +364,13 @@ def _football_probs(home_rating: int, away_rating: int, league: str, home_form: 
     return p1 / total, px / total, p2 / total
 
 
-def _hockey_probs(home_rating: int, away_rating: int, home_form: int, away_form: int) -> tuple[float, None, float]:
+def _hockey_probs(bot, home_rating: int, away_rating: int, home_team: str, away_team: str, sport_key: str, home_form: int, away_form: int) -> tuple[float, None, float]:
     home_adv = float(os.getenv("AI_LINE_HOME_ADV_NHL", "45") or "45")
-    diff = (home_rating + home_adv + home_form) - (away_rating + away_form)
+    
+    # Добавляем анализ личных встреч для хоккея
+    h2h_home_bonus, h2h_away_bonus = _head_to_head_bonus(bot, sport_key, home_team, away_team)
+    
+    diff = (home_rating + home_adv + home_form + h2h_home_bonus) - (away_rating + away_form + h2h_away_bonus)
     p1 = 1.0 / (1.0 + 10 ** (-diff / 420.0))
     p1 = _clamp(p1, 0.18, 0.82)
     return p1, None, 1.0 - p1
@@ -345,8 +413,8 @@ def ai_probs_1x2(bot, match: dict) -> tuple[float, float | None, float]:
     away_form = _form_bonus(bot, sport_key, away)
 
     if sport_key == "nhl":
-        return _hockey_probs(home_rating, away_rating, home_form, away_form)
-    return _football_probs(home_rating, away_rating, league, home_form, away_form)
+        return _hockey_probs(bot, home_rating, away_rating, home, away, sport_key, home_form, away_form)
+    return _football_probs(bot, home_rating, away_rating, league, home, away, sport_key, home_form, away_form)
 
 
 def ai_odds_for_match(bot, match: dict) -> dict:
